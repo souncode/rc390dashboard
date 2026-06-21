@@ -1,0 +1,511 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <mcp2515.h>
+
+// =========================
+// WiFi
+// =========================
+const char *WIFI_SSID = "Khong Co Mat Khau";
+const char *WIFI_PASS = "motdenchin";
+
+// =========================
+// MCP2515 / SPI config
+// =========================
+#define CAN_CS 5
+#define CAN_INT 4
+
+#define SPI_SCK 18
+#define SPI_MISO 19
+#define SPI_MOSI 23
+
+// doi neu module cua ban la 16MHz
+#define MCP_CLOCK MCP_8MHZ
+
+// neu khong doc duoc thi thu CAN_250KBPS
+#define CAN_SPEED CAN_500KBPS
+
+MCP2515 mcp2515(CAN_CS);
+struct can_frame txFrame;
+struct can_frame rxFrame;
+
+WebServer server(80);
+
+// =========================
+// OBD PID
+// =========================
+const uint8_t PID_RPM = 0x0C;
+const uint8_t PID_SPD = 0x0D;
+const uint8_t PID_ECT = 0x05;
+const uint8_t PID_IAT = 0x0F;
+const uint8_t PID_MAP = 0x0B;
+const uint8_t PID_TPS = 0x11;
+
+const uint8_t pidList[] = {
+    PID_RPM,
+    PID_SPD,
+    PID_ECT,
+    PID_IAT,
+    PID_MAP,
+    PID_TPS};
+
+const int pidCount = sizeof(pidList) / sizeof(pidList[0]);
+int pidIndex = 0;
+
+// =========================
+// Data
+// =========================
+volatile float rpm = 0;
+volatile int speedKmh = 0;
+volatile int coolantC = 0;
+volatile int iatC = 0;
+volatile int mapKpa = 0;
+volatile float tpsPercent = 0;
+volatile int gear = -1;
+
+volatile bool gotRPM = false;
+volatile bool gotSPD = false;
+volatile bool gotECT = false;
+volatile bool gotIAT = false;
+volatile bool gotMAP = false;
+volatile bool gotTPS = false;
+volatile bool gotGear = false;
+
+unsigned long lastReq = 0;
+unsigned long lastPrint = 0;
+unsigned long lastDataMs = 0;
+
+// =========================
+// Gear filter
+// =========================
+unsigned long neutralCandidateMs = 0;
+const unsigned long NEUTRAL_DEBOUNCE_MS = 250;
+
+// =========================
+// HTML page
+// =========================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RC390 Monitor</title>
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: #eee;
+      font-family: Arial, sans-serif;
+    }
+    .wrap {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+    .title {
+      font-size: 28px;
+      font-weight: bold;
+      margin-bottom: 12px;
+    }
+    .status {
+      margin-bottom: 16px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      background: #1c1c1c;
+      font-size: 14px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }
+    .card {
+      background: #1c1c1c;
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.25);
+    }
+    .label {
+      font-size: 14px;
+      color: #bbb;
+      margin-bottom: 8px;
+    }
+    .value {
+      font-size: 34px;
+      font-weight: bold;
+    }
+    .unit {
+      font-size: 16px;
+      color: #aaa;
+      margin-left: 6px;
+    }
+    .big {
+      grid-column: span 2;
+    }
+    @media (max-width: 700px) {
+      .big {
+        grid-column: span 1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">RC390 CAN Monitor</div>
+    <div class="status" id="status">Connecting...</div>
+
+    <div class="grid">
+      <div class="card big">
+        <div class="label">RPM</div>
+        <div class="value"><span id="rpm">---</span><span class="unit">rpm</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Speed</div>
+        <div class="value"><span id="speed">---</span><span class="unit">km/h</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">TPS</div>
+        <div class="value"><span id="tps">---</span><span class="unit">%</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Coolant</div>
+        <div class="value"><span id="coolant">---</span><span class="unit">°C</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">IAT</div>
+        <div class="value"><span id="iat">---</span><span class="unit">°C</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">MAP</div>
+        <div class="value"><span id="map">---</span><span class="unit">kPa</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Gear</div>
+        <div class="value"><span id="gear">---</span></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+async function loadData() {
+  try {
+    const res = await fetch('/api/data?_=' + Date.now());
+    const d = await res.json();
+
+    document.getElementById('rpm').textContent = d.gotRPM ? d.rpm : '---';
+    document.getElementById('speed').textContent = d.gotSPD ? d.speed : '---';
+    document.getElementById('tps').textContent = d.gotTPS ? d.tps : '---';
+    document.getElementById('coolant').textContent = d.gotECT ? d.coolant : '---';
+    document.getElementById('iat').textContent = d.gotIAT ? d.iat : '---';
+    document.getElementById('map').textContent = d.gotMAP ? d.map : '---';
+    document.getElementById('gear').textContent =
+      d.gotGear ? (d.gear === 0 ? 'N' : d.gear) : '---';
+
+    let statusText = "WiFi OK | ";
+    statusText += d.canAlive ? "CAN OK" : "CAN timeout";
+    statusText += " | IP: " + d.ip;
+    document.getElementById('status').textContent = statusText;
+  } catch (e) {
+    document.getElementById('status').textContent = 'Web update error';
+  }
+}
+
+loadData();
+setInterval(loadData, 300);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =========================
+// OBD
+// =========================
+void sendOBDRequest(uint8_t pid)
+{
+  txFrame.can_id = 0x7DF;
+  txFrame.can_dlc = 8;
+  txFrame.data[0] = 0x02;
+  txFrame.data[1] = 0x01;
+  txFrame.data[2] = pid;
+  txFrame.data[3] = 0x00;
+  txFrame.data[4] = 0x00;
+  txFrame.data[5] = 0x00;
+  txFrame.data[6] = 0x00;
+  txFrame.data[7] = 0x00;
+
+  mcp2515.sendMessage(&txFrame);
+}
+
+void decodeOBD(const can_frame &f)
+{
+  if (f.can_id < 0x7E8 || f.can_id > 0x7EF)
+    return;
+  if (f.can_dlc < 4)
+    return;
+  if (f.data[1] != 0x41)
+    return;
+
+  uint8_t pid = f.data[2];
+  lastDataMs = millis();
+
+  switch (pid)
+  {
+  case PID_RPM:
+    if (f.can_dlc >= 5)
+    {
+      int A = f.data[3];
+      int B = f.data[4];
+      rpm = ((A * 256.0f) + B) / 4.0f;
+      gotRPM = true;
+    }
+    break;
+
+  case PID_SPD:
+    speedKmh = f.data[3];
+    gotSPD = true;
+    break;
+
+  case PID_ECT:
+    coolantC = (int)f.data[3] - 40;
+    gotECT = true;
+    break;
+
+  case PID_IAT:
+    iatC = (int)f.data[3] - 40;
+    gotIAT = true;
+    break;
+
+  case PID_MAP:
+    mapKpa = f.data[3];
+    gotMAP = true;
+    break;
+
+  case PID_TPS:
+    tpsPercent = f.data[3] * 100.0f / 255.0f;
+    gotTPS = true;
+    break;
+  }
+}
+
+// =========================
+// Gear fixed map
+// Gear frame hop le:
+// ID = 0x540
+// byte0 = 0x02
+// byte3 = gear
+// byte4 = 0x11
+// byte6 = 0x01
+//
+// Frame 04/06 all-zero duoc xem la neutral candidate,
+// chi nhan la N sau khi debounce va xe dang dung yen.
+// =========================
+void decodeCustomFrames(const can_frame &f)
+{
+  if (f.can_id != 0x540 || f.can_dlc < 8)
+    return;
+
+  // Frame gear hop le: 1..6
+  if (f.data[0] == 0x02 && f.data[4] == 0x11 && f.data[6] == 0x01)
+  {
+    uint8_t v = f.data[3];
+
+    if (v >= 1 && v <= 6)
+    {
+      gear = v;
+      gotGear = true;
+      neutralCandidateMs = 0;
+    }
+    return;
+  }
+
+  // Neutral candidate frame
+  bool neutralFrame =
+      (f.data[3] == 0x00) &&
+      (f.data[4] == 0x00) &&
+      (f.data[6] == 0x00) &&
+      (f.data[7] == 0x00) &&
+      (f.data[0] == 0x04 || f.data[0] == 0x06);
+
+  if (neutralFrame)
+  {
+    if (neutralCandidateMs == 0)
+    {
+      neutralCandidateMs = millis();
+    }
+    else if ((millis() - neutralCandidateMs) >= NEUTRAL_DEBOUNCE_MS && speedKmh == 0)
+    {
+      gear = 0; // Neutral
+      gotGear = true;
+    }
+  }
+  else
+  {
+    neutralCandidateMs = 0;
+  }
+}
+
+// =========================
+// Web handlers
+// =========================
+void handleRoot()
+{
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleApiData()
+{
+  bool canAlive = (millis() - lastDataMs) < 2000;
+
+  String json = "{";
+  json += "\"rpm\":" + String((int)rpm) + ",";
+  json += "\"speed\":" + String(speedKmh) + ",";
+  json += "\"coolant\":" + String(coolantC) + ",";
+  json += "\"iat\":" + String(iatC) + ",";
+  json += "\"map\":" + String(mapKpa) + ",";
+  json += "\"tps\":" + String(tpsPercent, 1) + ",";
+  json += "\"gear\":" + String(gear) + ",";
+
+  json += "\"gotRPM\":";
+  json += (gotRPM ? "true" : "false");
+  json += ",";
+
+  json += "\"gotSPD\":";
+  json += (gotSPD ? "true" : "false");
+  json += ",";
+
+  json += "\"gotECT\":";
+  json += (gotECT ? "true" : "false");
+  json += ",";
+
+  json += "\"gotIAT\":";
+  json += (gotIAT ? "true" : "false");
+  json += ",";
+
+  json += "\"gotMAP\":";
+  json += (gotMAP ? "true" : "false");
+  json += ",";
+
+  json += "\"gotTPS\":";
+  json += (gotTPS ? "true" : "false");
+  json += ",";
+
+  json += "\"gotGear\":";
+  json += (gotGear ? "true" : "false");
+  json += ",";
+
+  json += "\"canAlive\":";
+  json += (canAlive ? "true" : "false");
+  json += ",";
+
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleNotFound()
+{
+  server.send(404, "text/plain", "Not found");
+}
+
+// =========================
+// Setup
+// =========================
+void setup()
+{
+  Serial.begin(115200);
+  delay(50);
+
+  // SPI + MCP2515
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, CAN_CS);
+  mcp2515.reset();
+  mcp2515.setBitrate(CAN_SPEED, MCP_CLOCK);
+  mcp2515.setNormalMode();
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("WiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Web server
+  server.on("/", handleRoot);
+  server.on("/api/data", handleApiData);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  Serial.println("Web server started");
+}
+
+// =========================
+// Loop
+// =========================
+void loop()
+{
+  server.handleClient();
+
+  // gui request luan phien
+  if (millis() - lastReq >= 120)
+  {
+    sendOBDRequest(pidList[pidIndex]);
+    pidIndex++;
+    if (pidIndex >= pidCount)
+      pidIndex = 0;
+    lastReq = millis();
+  }
+
+  // doc CAN
+  if (mcp2515.readMessage(&rxFrame) == MCP2515::ERROR_OK)
+  {
+    decodeOBD(rxFrame);
+    decodeCustomFrames(rxFrame);
+  }
+
+  // log serial
+  if (millis() - lastPrint >= 1000)
+  {
+    Serial.print("RPM=");
+    Serial.print(gotRPM ? String((int)rpm) : "---");
+    Serial.print(" | SPD=");
+    Serial.print(gotSPD ? String(speedKmh) : "---");
+    Serial.print(" | ECT=");
+    Serial.print(gotECT ? String(coolantC) : "---");
+    Serial.print(" | IAT=");
+    Serial.print(gotIAT ? String(iatC) : "---");
+    Serial.print(" | MAP=");
+    Serial.print(gotMAP ? String(mapKpa) : "---");
+    Serial.print(" | TPS=");
+    Serial.print(gotTPS ? String(tpsPercent, 1) : "---");
+    Serial.print(" | GEAR=");
+    if (!gotGear)
+    {
+      Serial.println("---");
+    }
+    else if (gear == 0)
+    {
+      Serial.println("N");
+    }
+    else
+    {
+      Serial.println(gear);
+    }
+
+    lastPrint = millis();
+  }
+}

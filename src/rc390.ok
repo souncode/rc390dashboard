@@ -1,0 +1,1861 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <SPI.h>
+#include <pgmspace.h>
+#include <mcp2515.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <Fonts/FreeSansBold24pt7b.h>
+#include "splash_logo.h"
+#include "dashboard_bg.h"
+
+// =========================
+// Hotspot
+// =========================
+const char *AP_SSID = "RC390-Monitor";
+const char *AP_PASS = "";
+
+// =========================
+// SPI chung
+// =========================
+#define SPI_SCK 18
+#define SPI_MISO 19
+#define SPI_MOSI 23
+
+// =========================
+// MCP2515
+// =========================
+#define CAN_CS 5
+#define CAN_INT 4
+#define MCP_CLOCK MCP_8MHZ
+#define CAN_SPEED CAN_500KBPS
+
+MCP2515 mcp2515(CAN_CS);
+struct can_frame txFrame;
+struct can_frame rxFrame;
+
+// =========================
+// TFT / TOUCH / SD
+// =========================
+#define TFT_CS 14
+#define TFT_DC 27
+#define TFT_RST 26
+
+#define TOUCH_CS 33
+#define TOUCH_IRQ 32
+
+#define SD_CS 13
+
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+// =========================
+// Web
+// =========================
+WebServer server(80);
+Preferences prefs;
+
+// =========================
+// User config
+// =========================
+const int DEFAULT_RPM_RED_LIMIT = 8500;
+const int DEFAULT_SPEED_FULLSCREEN_LIMIT = 100;
+const float DEFAULT_TPS_MIN = 10.2f;
+const float DEFAULT_TPS_MAX = 85.5f;
+int rpmRedLimit = DEFAULT_RPM_RED_LIMIT;
+int speedFullscreenLimit = DEFAULT_SPEED_FULLSCREEN_LIMIT;
+float tpsCalMin = DEFAULT_TPS_MIN;
+float tpsCalMax = DEFAULT_TPS_MAX;
+
+enum UiLayoutId
+{
+  UI_RPM_WARN,
+  UI_RPM_BAR,
+  UI_RPM_VALUE,
+  UI_GEAR,
+  UI_GEAR_LIST,
+  UI_SPEED,
+  UI_TOP_SPEED,
+  UI_ECT,
+  UI_IAT,
+  UI_MAP,
+  UI_TPS,
+  UI_FUEL,
+  UI_CAN_STATUS,
+  UI_OBD_STATUS,
+  UI_TEMP_STATUS,
+  UI_VOLTAGE,
+  UI_LAYOUT_COUNT
+};
+
+struct UiRect
+{
+  int16_t x;
+  int16_t y;
+  int16_t w;
+  int16_t h;
+};
+
+struct UiLayoutDef
+{
+  const char *id;
+  const char *label;
+  const char *keyX;
+  const char *keyY;
+  const char *keyW;
+  const char *keyH;
+  UiRect def;
+};
+
+const UiLayoutDef UI_LAYOUT_DEFS[UI_LAYOUT_COUNT] = {
+    {"rpmWarn", "RPM lock", "xRpW", "yRpW", "wRpW", "hRpW", {8, 28, 48, 24}},
+    {"rpmBar", "RPM bar", "xRpB", "yRpB", "wRpB", "hRpB", {45, 34, 218, 14}},
+    {"rpm", "RPM", "xRpm", "yRpm", "wRpm", "hRpm", {266, 31, 50, 26}},
+    {"gear", "Gear", "xGea", "yGea", "wGea", "hGea", {18, 78, 54, 58}},
+    {"gearList", "Gear list", "xGeL", "yGeL", "wGeL", "hGeL", {10, 134, 56, 14}},
+    {"speed", "Speed", "xSpd", "ySpd", "wSpd", "hSpd", {91, 80, 140, 62}},
+    {"top", "Top speed", "xTop", "yTop", "wTop", "hTop", {257, 92, 58, 42}},
+    {"ect", "ECT", "xEct", "yEct", "wEct", "hEct", {4, 162, 54, 25}},
+    {"iat", "IAT", "xIat", "yIat", "wIat", "hIat", {68, 162, 54, 25}},
+    {"map", "MAP", "xMap", "yMap", "wMap", "hMap", {132, 162, 54, 25}},
+    {"tps", "TPS", "xTps", "yTps", "wTps", "hTps", {196, 162, 54, 25}},
+    {"fuel", "Fuel", "xFul", "yFul", "wFul", "hFul", {260, 162, 54, 25}},
+    {"can", "CAN", "xCan", "yCan", "wCan", "hCan", {7, 220, 60, 12}},
+    {"obd", "OBD", "xObd", "yObd", "wObd", "hObd", {85, 220, 60, 12}},
+    {"temp", "Temp", "xTmp", "yTmp", "wTmp", "hTmp", {152, 220, 84, 12}},
+    {"volt", "Voltage", "xVol", "yVol", "wVol", "hVol", {247, 220, 62, 12}},
+};
+
+UiRect uiLayout[UI_LAYOUT_COUNT];
+bool pendingFullRedraw = false;
+
+// =========================
+// OBD PID
+// =========================
+const uint8_t PID_RPM = 0x0C;
+const uint8_t PID_SPD = 0x0D;
+const uint8_t PID_ECT = 0x05;
+const uint8_t PID_IAT = 0x0F;
+const uint8_t PID_MAP = 0x0B;
+const uint8_t PID_TPS = 0x11;
+const uint8_t PID_FUEL = 0x2F;
+
+// =========================
+// Data
+// =========================
+volatile float rpm = 0;
+volatile int speedKmh = 0;
+volatile int topSpeedKmh = 0;
+volatile int coolantC = 0;
+volatile int iatC = 0;
+volatile int mapKpa = 0;
+volatile float tpsRawPercent = 0;
+volatile float tpsPercent = 0;
+volatile float fuelPercent = 0;
+volatile int gear = -1;
+
+volatile bool gotRPM = false;
+volatile bool gotSPD = false;
+volatile bool gotECT = false;
+volatile bool gotIAT = false;
+volatile bool gotMAP = false;
+volatile bool gotTPS = false;
+volatile bool gotFuel = false;
+volatile bool gotGear = false;
+
+unsigned long lastDataMs = 0;
+unsigned long lastPrint = 0;
+unsigned long lastScreen = 0;
+
+// =========================
+// Request scheduler
+// Uu tien RPM, speed, TPS va tranh gui request theo cum.
+// =========================
+unsigned long lastReqRPM = 0;
+unsigned long lastReqSPD = 0;
+unsigned long lastReqTPS = 0;
+unsigned long lastReqSlow = 0;
+unsigned long lastReqFuel = 0;
+unsigned long lastReqAny = 0;
+
+uint8_t slowIdx = 0; // ECT, IAT, MAP
+
+const uint16_t MIN_OBD_REQ_GAP_MS = 8;
+const uint16_t RPM_REQ_MS = 28;
+const uint16_t SPD_REQ_MS = 45;
+const uint16_t TPS_REQ_MS = 55;
+const uint16_t SLOW_REQ_MS = 450;
+const uint16_t FUEL_REQ_MS = 1800;
+
+// =========================
+// Gear filter
+// =========================
+unsigned long neutralCandidateMs = 0;
+const unsigned long NEUTRAL_DEBOUNCE_MS = 120;
+unsigned long lastGearMs = 0;
+const unsigned long GEAR_HOLD_MS = 1500;
+
+// =========================
+// UI cache
+// =========================
+const uint16_t SCREEN_INTERVAL_MS = 80;
+const uint16_t RPM_LOCK_FLASH_MS = 120;
+
+const int INVALID_VAL = -100000;
+
+const int RPM_REDRAW_DELTA = 50;
+const int SPD_REDRAW_DELTA = 1;
+const int TEMP_REDRAW_DELTA = 1;
+const int MAP_REDRAW_DELTA = 1;
+const int TPS_REDRAW_DELTA10 = 3;  // 0.3%
+const int FUEL_REDRAW_DELTA10 = 5; // 0.5%
+
+struct UiCache
+{
+  int rpm = INVALID_VAL;
+  int spd = INVALID_VAL;
+  int ect = INVALID_VAL;
+  int iat = INVALID_VAL;
+  int map = INVALID_VAL;
+  int gear = INVALID_VAL;
+  int tps10 = INVALID_VAL;
+  int fuel10 = INVALID_VAL;
+  int topspd = INVALID_VAL;
+
+  int canAlive = -1;
+} uiCache;
+
+bool speedFullscreenActive = false;
+bool rpmLockFlash = false;
+bool rpmLockActiveLast = false;
+unsigned long lastRpmLockFlashMs = 0;
+
+// =========================
+// HTML
+// =========================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RC390 Monitor</title>
+  <style>
+    body { margin:0; background:#111; color:#eee; font-family:Arial,sans-serif; }
+    .wrap { max-width:1000px; margin:0 auto; padding:16px; }
+    .title { font-size:28px; font-weight:bold; margin-bottom:12px; }
+    .status { margin-bottom:16px; padding:10px 14px; border-radius:10px; background:#1c1c1c; font-size:14px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; }
+    .card { background:#1c1c1c; border-radius:14px; padding:16px; box-shadow:0 0 10px rgba(0,0,0,0.25); }
+    .label { font-size:14px; color:#bbb; margin-bottom:8px; }
+    .value { font-size:34px; font-weight:bold; }
+    .unit { font-size:16px; color:#aaa; margin-left:6px; }
+    .big { grid-column:span 2; }
+    .config { margin-top:16px; display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+    .field { display:flex; flex-direction:column; gap:6px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; align-items:end; }
+    input { background:#111; color:#eee; border:1px solid #444; border-radius:8px; padding:10px; font-size:18px; }
+    button { align-self:end; background:#f57c00; color:#111; border:0; border-radius:8px; padding:11px 18px; font-weight:bold; cursor:pointer; }
+    .secondary { background:#333; color:#eee; border:1px solid #555; }
+    button:active { transform:translateY(1px); }
+    .layout-card { margin-top:16px; }
+    .layout-head { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+    .layout-title { font-size:18px; font-weight:bold; color:#fff; }
+    .screen-wrap { width:min(100%,640px); margin:0 auto; position:relative; touch-action:none; user-select:none; }
+    .screen-wrap img { width:100%; display:block; border:1px solid #333; border-radius:8px; }
+    .marker { position:absolute; border:2px solid #ff7a00; background:rgba(255,122,0,0.16); color:#fff; font-size:11px; font-weight:bold; display:flex; align-items:center; justify-content:center; cursor:move; box-sizing:border-box; text-shadow:0 1px 2px #000; }
+    .marker.active { border-color:#fff; background:rgba(0,190,255,0.24); }
+    .coord-grid { margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:8px; }
+    .coord-row { background:#141414; border:1px solid #333; border-radius:8px; padding:8px; display:grid; grid-template-columns:1fr 42px 42px 42px 42px; gap:6px; align-items:center; }
+    .coord-row span { color:#bbb; font-size:13px; }
+    .coord-row input { padding:7px; font-size:14px; border-radius:6px; }
+    @media (max-width:700px){ .big { grid-column:span 1; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">RC390 CAN Monitor</div>
+    <div class="status" id="status">Connecting...</div>
+
+    <div class="grid">
+      <div class="card big">
+        <div class="label">RPM</div>
+        <div class="value"><span id="rpm">---</span><span class="unit">rpm</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Speed</div>
+        <div class="value"><span id="speed">---</span><span class="unit">km/h</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">TPS</div>
+        <div class="value"><span id="tps">---</span><span class="unit">%</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Coolant</div>
+        <div class="value"><span id="coolant">---</span><span class="unit">°C</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">IAT</div>
+        <div class="value"><span id="iat">---</span><span class="unit">°C</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">MAP</div>
+        <div class="value"><span id="map">---</span><span class="unit">kPa</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Fuel</div>
+        <div class="value"><span id="fuel">---</span><span class="unit">%</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Gear</div>
+        <div class="value"><span id="gear">---</span></div>
+      </div>
+    </div>
+
+    <div class="card config">
+      <div class="field">
+        <label class="label" for="rpmLimit">RPM red limit</label>
+        <input id="rpmLimit" type="number" min="1000" max="16000" step="100">
+      </div>
+      <div class="field">
+        <label class="label" for="speedLimit">Speed fullscreen limit</label>
+        <input id="speedLimit" type="number" min="1" max="300" step="1">
+      </div>
+      <div class="field">
+        <label class="label">TPS raw</label>
+        <div class="value"><span id="tpsRaw">---</span><span class="unit">%</span></div>
+      </div>
+      <div class="field">
+        <label class="label" for="tpsMin">TPS 0% raw</label>
+        <input id="tpsMin" type="number" min="0" max="100" step="0.1">
+      </div>
+      <div class="field">
+        <label class="label" for="tpsMax">TPS 100% raw</label>
+        <input id="tpsMax" type="number" min="0" max="100" step="0.1">
+      </div>
+      <div class="actions">
+        <button class="secondary" onclick="calibrateTps('min')">Set 0%</button>
+        <button class="secondary" onclick="calibrateTps('max')">Set 100%</button>
+      </div>
+      <button onclick="saveConfig()">Save</button>
+    </div>
+
+    <div class="card layout-card">
+      <div class="layout-head">
+        <div class="layout-title">Dashboard layout</div>
+        <div class="actions">
+          <button class="secondary" onclick="resetLayout()">Reset</button>
+          <button onclick="saveLayout()">Save layout</button>
+        </div>
+      </div>
+      <div id="screenWrap" class="screen-wrap">
+        <img id="bgPreview" src="/background.bmp" alt="">
+      </div>
+      <div id="coordGrid" class="coord-grid"></div>
+    </div>
+  </div>
+
+<script>
+let configLoaded = false;
+let layout = {};
+let defaultLayout = {};
+let activeMarker = null;
+let activeId = '';
+
+function applyConfig(d) {
+  document.getElementById('rpmLimit').value = d.rpmLimit;
+  document.getElementById('speedLimit').value = d.speedLimit;
+  document.getElementById('tpsMin').value = d.tpsMin;
+  document.getElementById('tpsMax').value = d.tpsMax;
+  if (d.layout) {
+    layout = d.layout;
+    defaultLayout = d.layoutDefault || {};
+    renderLayout();
+  }
+  configLoaded = true;
+}
+
+async function loadConfigUi() {
+  try {
+    const res = await fetch('/api/config?_=' + Date.now());
+    applyConfig(await res.json());
+  } catch (e) {}
+}
+
+function screenScale() {
+  const wrap = document.getElementById('screenWrap');
+  return wrap.clientWidth / 320;
+}
+
+function renderLayout() {
+  const wrap = document.getElementById('screenWrap');
+  const grid = document.getElementById('coordGrid');
+  wrap.querySelectorAll('.marker').forEach(el => el.remove());
+  grid.innerHTML = '';
+  const scale = screenScale();
+
+  Object.keys(layout).forEach(id => {
+    const p = layout[id];
+    const marker = document.createElement('div');
+    marker.className = 'marker';
+    marker.dataset.id = id;
+    marker.textContent = p.label || id;
+    marker.style.left = (p.x * scale) + 'px';
+    marker.style.top = (p.y * scale) + 'px';
+    marker.style.width = (p.w * scale) + 'px';
+    marker.style.height = (p.h * scale) + 'px';
+    marker.addEventListener('pointerdown', startDrag);
+    marker.addEventListener('wheel', scaleMarker);
+    wrap.appendChild(marker);
+
+    const row = document.createElement('div');
+    row.className = 'coord-row';
+    row.innerHTML = '<span>' + (p.label || id) + '</span>' +
+      '<input id="x_' + id + '" type="number" min="0" max="319" value="' + p.x + '">' +
+      '<input id="y_' + id + '" type="number" min="0" max="239" value="' + p.y + '">' +
+      '<input id="w_' + id + '" type="number" min="4" max="320" value="' + p.w + '">' +
+      '<input id="h_' + id + '" type="number" min="4" max="240" value="' + p.h + '">';
+    grid.appendChild(row);
+    row.querySelectorAll('input').forEach(input => input.addEventListener('change', () => {
+      p.w = Math.max(4, Math.min(320, parseInt(document.getElementById('w_' + id).value || '4')));
+      p.h = Math.max(4, Math.min(240, parseInt(document.getElementById('h_' + id).value || '4')));
+      p.x = Math.max(0, Math.min(320 - p.w, parseInt(document.getElementById('x_' + id).value || '0')));
+      p.y = Math.max(0, Math.min(240 - p.h, parseInt(document.getElementById('y_' + id).value || '0')));
+      renderLayout();
+    }));
+  });
+}
+
+function startDrag(e) {
+  activeMarker = e.currentTarget;
+  activeId = activeMarker.dataset.id;
+  activeMarker.classList.add('active');
+  activeMarker.setPointerCapture(e.pointerId);
+  activeMarker.addEventListener('pointermove', dragMove);
+  activeMarker.addEventListener('pointerup', endDrag);
+  activeMarker.addEventListener('pointercancel', endDrag);
+}
+
+function dragMove(e) {
+  if (!activeMarker || !layout[activeId]) return;
+  const wrap = document.getElementById('screenWrap');
+  const rect = wrap.getBoundingClientRect();
+  const scale = screenScale();
+  const p = layout[activeId];
+  p.x = Math.round((e.clientX - rect.left) / scale - p.w / 2);
+  p.y = Math.round((e.clientY - rect.top) / scale - p.h / 2);
+  p.x = Math.max(0, Math.min(320 - p.w, p.x));
+  p.y = Math.max(0, Math.min(240 - p.h, p.y));
+  activeMarker.style.left = (p.x * scale) + 'px';
+  activeMarker.style.top = (p.y * scale) + 'px';
+  document.getElementById('x_' + activeId).value = p.x;
+  document.getElementById('y_' + activeId).value = p.y;
+}
+
+function endDrag(e) {
+  if (!activeMarker) return;
+  activeMarker.classList.remove('active');
+  activeMarker.removeEventListener('pointermove', dragMove);
+  activeMarker.removeEventListener('pointerup', endDrag);
+  activeMarker.removeEventListener('pointercancel', endDrag);
+  activeMarker = null;
+  activeId = '';
+}
+
+function scaleMarker(e) {
+  e.preventDefault();
+  const id = e.currentTarget.dataset.id;
+  const p = layout[id];
+  if (!p) return;
+  const step = e.deltaY < 0 ? 2 : -2;
+  p.w = Math.max(4, Math.min(320, p.w + step * 2));
+  p.h = Math.max(4, Math.min(240, p.h + step));
+  p.x = Math.max(0, Math.min(320 - p.w, p.x - step));
+  p.y = Math.max(0, Math.min(240 - p.h, p.y - Math.round(step / 2)));
+  renderLayout();
+}
+
+async function loadData() {
+  try {
+    const res = await fetch('/api/data?_=' + Date.now());
+    const d = await res.json();
+
+    document.getElementById('rpm').textContent = d.gotRPM ? d.rpm : '---';
+    document.getElementById('speed').textContent = d.gotSPD ? d.speed : '---';
+    document.getElementById('tps').textContent = d.gotTPS ? d.tps : '---';
+    document.getElementById('tpsRaw').textContent = d.gotTPS ? d.tpsRaw : '---';
+    document.getElementById('coolant').textContent = d.gotECT ? d.coolant : '---';
+    document.getElementById('iat').textContent = d.gotIAT ? d.iat : '---';
+    document.getElementById('map').textContent = d.gotMAP ? d.map : '---';
+    document.getElementById('fuel').textContent = d.gotFuel ? d.fuel : '---';
+    document.getElementById('gear').textContent =
+      d.gotGear ? (d.gear === 0 ? 'N' : d.gear) : '---';
+
+    let statusText = "Hotspot OK | ";
+    statusText += d.canAlive ? "CAN OK" : "CAN timeout";
+    statusText += " | IP: " + d.ip;
+    document.getElementById('status').textContent = statusText;
+
+    if (!configLoaded) {
+      loadConfigUi();
+    }
+  } catch (e) {
+    document.getElementById('status').textContent = 'Web update error';
+  }
+}
+
+async function saveConfig() {
+  const body = new URLSearchParams({
+    rpmLimit: document.getElementById('rpmLimit').value,
+    speedLimit: document.getElementById('speedLimit').value,
+    tpsMin: document.getElementById('tpsMin').value,
+    tpsMax: document.getElementById('tpsMax').value
+  });
+  const res = await fetch('/api/config', { method:'POST', body });
+  const d = await res.json();
+  applyConfig(d);
+  document.getElementById('status').textContent = 'Saved limits';
+}
+
+async function saveLayout() {
+  const body = new URLSearchParams();
+  Object.keys(layout).forEach(id => {
+    body.set('x_' + id, layout[id].x);
+    body.set('y_' + id, layout[id].y);
+    body.set('w_' + id, layout[id].w);
+    body.set('h_' + id, layout[id].h);
+  });
+  const res = await fetch('/api/config', { method:'POST', body });
+  applyConfig(await res.json());
+  document.getElementById('status').textContent = 'Saved layout';
+}
+
+async function resetLayout() {
+  const body = new URLSearchParams({ layoutReset: '1' });
+  const res = await fetch('/api/config', { method:'POST', body });
+  applyConfig(await res.json());
+  document.getElementById('status').textContent = 'Layout reset';
+}
+
+async function calibrateTps(point) {
+  const body = new URLSearchParams({ tpsCalibrate: point });
+  const res = await fetch('/api/config', { method:'POST', body });
+  const d = await res.json();
+  applyConfig(d);
+  document.getElementById('status').textContent = d.tpsCalOk ? 'TPS calibration saved' : 'TPS raw not ready';
+}
+
+window.addEventListener('resize', renderLayout);
+loadConfigUi();
+loadData();
+setInterval(loadData, 300);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =========================
+// Debug helper
+// =========================
+void dbg(const char *s)
+{
+  Serial.println(s);
+  Serial.flush();
+  delay(50);
+}
+
+// =========================
+// SPI helpers
+// =========================
+void deselectAllSPI()
+{
+  digitalWrite(CAN_CS, HIGH);
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TOUCH_CS, HIGH);
+  digitalWrite(SD_CS, HIGH);
+}
+
+// =========================
+// TFT helpers
+// =========================
+bool needsRedraw(int oldVal, int newVal, int delta, bool force = false)
+{
+  if (force)
+    return true;
+  if (oldVal == INVALID_VAL || newVal == INVALID_VAL)
+    return oldVal != newVal;
+  return abs(newVal - oldVal) >= delta;
+}
+
+void invalidateUiCache()
+{
+  uiCache = UiCache();
+}
+
+float clampFloat(float value, float minValue, float maxValue)
+{
+  if (value < minValue)
+    return minValue;
+  if (value > maxValue)
+    return maxValue;
+  return value;
+}
+
+void normalizeTpsCalibration()
+{
+  tpsCalMin = clampFloat(tpsCalMin, 0.0f, 100.0f);
+  tpsCalMax = clampFloat(tpsCalMax, 0.0f, 100.0f);
+  if (tpsCalMin > 99.0f)
+    tpsCalMin = 99.0f;
+  if (tpsCalMax < tpsCalMin + 1.0f)
+    tpsCalMax = tpsCalMin + 1.0f;
+}
+
+void clampUiRect(UiRect &r)
+{
+  if (r.w < 4)
+    r.w = 4;
+  if (r.h < 4)
+    r.h = 4;
+  r.x = constrain(r.x, 0, 320 - r.w);
+  r.y = constrain(r.y, 0, 240 - r.h);
+}
+
+void resetLayoutDefaults()
+{
+  for (int i = 0; i < UI_LAYOUT_COUNT; i++)
+  {
+    uiLayout[i] = UI_LAYOUT_DEFS[i].def;
+    clampUiRect(uiLayout[i]);
+  }
+}
+
+void loadLayoutConfig()
+{
+  for (int i = 0; i < UI_LAYOUT_COUNT; i++)
+  {
+    uiLayout[i] = UI_LAYOUT_DEFS[i].def;
+    uiLayout[i].x = prefs.getInt(UI_LAYOUT_DEFS[i].keyX, uiLayout[i].x);
+    uiLayout[i].y = prefs.getInt(UI_LAYOUT_DEFS[i].keyY, uiLayout[i].y);
+    uiLayout[i].w = prefs.getInt(UI_LAYOUT_DEFS[i].keyW, uiLayout[i].w);
+    uiLayout[i].h = prefs.getInt(UI_LAYOUT_DEFS[i].keyH, uiLayout[i].h);
+    clampUiRect(uiLayout[i]);
+  }
+}
+
+void saveLayoutConfig()
+{
+  for (int i = 0; i < UI_LAYOUT_COUNT; i++)
+  {
+    prefs.putInt(UI_LAYOUT_DEFS[i].keyX, uiLayout[i].x);
+    prefs.putInt(UI_LAYOUT_DEFS[i].keyY, uiLayout[i].y);
+    prefs.putInt(UI_LAYOUT_DEFS[i].keyW, uiLayout[i].w);
+    prefs.putInt(UI_LAYOUT_DEFS[i].keyH, uiLayout[i].h);
+  }
+}
+
+void appendLayoutItemsJson(String &json, bool defaults)
+{
+  json += "{";
+  for (int i = 0; i < UI_LAYOUT_COUNT; i++)
+  {
+    const UiRect &r = defaults ? UI_LAYOUT_DEFS[i].def : uiLayout[i];
+    if (i)
+      json += ",";
+    json += "\"";
+    json += UI_LAYOUT_DEFS[i].id;
+    json += "\":{\"label\":\"";
+    json += UI_LAYOUT_DEFS[i].label;
+    json += "\",\"x\":";
+    json += String(r.x);
+    json += ",\"y\":";
+    json += String(r.y);
+    json += ",\"w\":";
+    json += String(r.w);
+    json += ",\"h\":";
+    json += String(r.h);
+    json += "}";
+  }
+  json += "}";
+}
+
+void appendLayoutJson(String &json, bool defaults)
+{
+  json += "\"layout\":";
+  appendLayoutItemsJson(json, defaults);
+}
+
+const uint16_t DASH_BLUE = 0x041F;
+const uint16_t DASH_CYAN = 0x07FF;
+const uint16_t DASH_DIM = 0x3186;
+const uint16_t DASH_DARK_BLUE = 0x0010;
+const uint16_t DASH_ORANGE = 0xFD20;
+const uint16_t DASH_PURPLE = 0xA01F;
+
+void printCentered(int x, int y, int w, int h, const char *text, uint16_t color, uint8_t size)
+{
+  tft.setFont();
+  tft.setTextSize(size);
+  tft.setTextColor(color, ST77XX_BLACK);
+
+  int16_t x1, y1;
+  uint16_t tw, th;
+  tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
+
+  int tx = x + (w - tw) / 2;
+  int ty = y + (h - th) / 2;
+  if (tx < x + 2)
+    tx = x + 2;
+  if (ty < y + 2)
+    ty = y + 2;
+
+  tft.setCursor(tx, ty);
+  tft.print(text);
+}
+
+void printFontCentered(int x, int y, int w, int h, const char *text, const GFXfont *font, uint16_t color, uint8_t size)
+{
+  tft.setFont(font);
+  tft.setTextSize(size);
+  tft.setTextColor(color);
+
+  int16_t x1, y1;
+  uint16_t tw, th;
+  tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
+
+  int tx = x + (w - tw) / 2 - x1;
+  int ty = y + (h - th) / 2 - y1;
+  if (tx < x + 1)
+    tx = x + 1;
+  if (ty < y + 1)
+    ty = y + 1;
+
+  tft.setCursor(tx, ty);
+  tft.print(text);
+  tft.setFont();
+  tft.setTextSize(1);
+}
+
+void printFontCentered(int x, int y, int w, int h, const char *text, const GFXfont *font, uint16_t color)
+{
+  printFontCentered(x, y, w, h, text, font, color, 1);
+}
+
+void drawPanel(int x, int y, int w, int h, uint16_t color)
+{
+  const int c = 5;
+  tft.fillRect(x + 1, y + 1, w - 2, h - 2, ST77XX_BLACK);
+  tft.drawLine(x + c, y, x + w - c - 1, y, color);
+  tft.drawLine(x + w - 1, y + c, x + w - 1, y + h - c - 1, color);
+  tft.drawLine(x + c, y + h - 1, x + w - c - 1, y + h - 1, color);
+  tft.drawLine(x, y + c, x, y + h - c - 1, color);
+  tft.drawLine(x, y + c, x + c, y, color);
+  tft.drawLine(x + w - c - 1, y, x + w - 1, y + c, color);
+  tft.drawLine(x + w - 1, y + h - c - 1, x + w - c - 1, y + h - 1, color);
+  tft.drawLine(x + c, y + h - 1, x, y + h - c - 1, color);
+}
+
+void fillQuad(int x0, int y0, int x1, int y1, int x2, int y2, int x3, int y3, uint16_t color)
+{
+  tft.fillTriangle(x0, y0, x1, y1, x2, y2, color);
+  tft.fillTriangle(x0, y0, x2, y2, x3, y3, color);
+}
+
+void drawSevenSegment(int x, int y, int w, int h, int t, uint8_t mask, uint16_t color)
+{
+  int mid = y + h / 2 - t / 2;
+  int vh = h / 2 - t;
+
+  if (mask & 0x01)
+    tft.fillRoundRect(x + t, y, w - 2 * t, t, t / 2, color);
+  if (mask & 0x02)
+    tft.fillRoundRect(x + w - t, y + t, t, vh, t / 2, color);
+  if (mask & 0x04)
+    tft.fillRoundRect(x + w - t, y + h / 2, t, vh, t / 2, color);
+  if (mask & 0x08)
+    tft.fillRoundRect(x + t, y + h - t, w - 2 * t, t, t / 2, color);
+  if (mask & 0x10)
+    tft.fillRoundRect(x, y + h / 2, t, vh, t / 2, color);
+  if (mask & 0x20)
+    tft.fillRoundRect(x, y + t, t, vh, t / 2, color);
+  if (mask & 0x40)
+    tft.fillRoundRect(x + t, mid, w - 2 * t, t, t / 2, color);
+}
+
+uint8_t sevenSegmentMask(char c)
+{
+  switch (c)
+  {
+  case '0':
+    return 0x3F;
+  case '1':
+    return 0x06;
+  case '2':
+    return 0x5B;
+  case '3':
+    return 0x4F;
+  case '4':
+    return 0x66;
+  case '5':
+    return 0x6D;
+  case '6':
+    return 0x7D;
+  case '7':
+    return 0x07;
+  case '8':
+    return 0x7F;
+  case '9':
+    return 0x6F;
+  case '-':
+    return 0x40;
+  default:
+    return 0;
+  }
+}
+
+int sevenTextWidth(const char *text, int digitW, int dotW, int gap)
+{
+  int width = 0;
+  for (int i = 0; text[i]; i++)
+  {
+    width += (text[i] == '.') ? dotW : digitW;
+    if (text[i + 1])
+      width += gap;
+  }
+  return width;
+}
+
+void drawSevenText(int x, int y, const char *text, int digitW, int digitH, int t, int gap, uint16_t color)
+{
+  int cx = x;
+  int dotW = t + 3;
+  for (int i = 0; text[i]; i++)
+  {
+    char c = text[i];
+    if (c == '.')
+    {
+      tft.fillCircle(cx + dotW / 2, y + digitH - t / 2, max(1, t / 2), color);
+      cx += dotW + gap;
+      continue;
+    }
+
+    uint8_t mask = sevenSegmentMask(c);
+    if (mask)
+      drawSevenSegment(cx, y, digitW, digitH, t, mask, color);
+    else if (c == 'N')
+    {
+      tft.fillRoundRect(cx, y, t, digitH, t / 2, color);
+      tft.fillRoundRect(cx + digitW - t, y, t, digitH, t / 2, color);
+      tft.drawLine(cx + t, y + 2, cx + digitW - t - 1, y + digitH - 3, color);
+      tft.drawLine(cx + t + 1, y + 2, cx + digitW - t, y + digitH - 3, color);
+    }
+    cx += digitW + gap;
+  }
+}
+
+void drawSevenTextCentered(int x, int y, int w, int h, const char *text, int digitW, int digitH, int t, int gap, uint16_t color)
+{
+  int dotW = t + 3;
+  int tw = sevenTextWidth(text, digitW, dotW, gap);
+  int tx = x + (w - tw) / 2;
+  int ty = y + (h - digitH) / 2;
+  if (tx < x)
+    tx = x;
+  if (ty < y)
+    ty = y;
+  drawSevenText(tx, ty, text, digitW, digitH, t, gap, color);
+}
+
+void drawSplashBitmap()
+{
+  for (int y = 0; y < SPLASH_LOGO_H; y++)
+  {
+    for (int x = 0; x < SPLASH_LOGO_W; x++)
+    {
+      uint16_t color = pgm_read_word(&SPLASH_LOGO_BITMAP[y * SPLASH_LOGO_W + x]);
+      tft.drawPixel(x, y, color);
+    }
+  }
+}
+
+void drawDashboardBackground()
+{
+  for (int y = 0; y < DASHBOARD_BG_H; y++)
+  {
+    for (int x = 0; x < DASHBOARD_BG_W; x++)
+    {
+      uint16_t color = pgm_read_word(&DASHBOARD_BG_BITMAP[y * DASHBOARD_BG_W + x]);
+      tft.drawPixel(x, y, color);
+    }
+  }
+}
+
+void drawDashboardRegion(int x, int y, int w, int h)
+{
+  for (int yy = y; yy < y + h; yy++)
+  {
+    for (int xx = x; xx < x + w; xx++)
+    {
+      if (xx >= 0 && xx < DASHBOARD_BG_W && yy >= 0 && yy < DASHBOARD_BG_H)
+      {
+        uint16_t color = pgm_read_word(&DASHBOARD_BG_BITMAP[yy * DASHBOARD_BG_W + xx]);
+        tft.drawPixel(xx, yy, color);
+      }
+    }
+  }
+}
+
+void drawKtmSplash()
+{
+  drawSplashBitmap();
+}
+
+void drawHeader()
+{
+  drawDashboardRegion(238, 0, 82, 22);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(240, 7);
+  tft.print(WiFi.softAPIP());
+}
+
+void drawStaticDashboard()
+{
+  drawDashboardBackground();
+  drawHeader();
+}
+
+void drawRpmBar(int rpmValue, bool valid)
+{
+  bool rpmWarning = valid && rpmValue >= rpmRedLimit;
+  uint16_t lockColor = rpmLockFlash ? ST77XX_WHITE : ST77XX_RED;
+  const UiRect &warnRect = uiLayout[UI_RPM_WARN];
+  const UiRect &barRect = uiLayout[UI_RPM_BAR];
+  const UiRect &valueRect = uiLayout[UI_RPM_VALUE];
+
+  drawDashboardRegion(warnRect.x, warnRect.y, warnRect.w, warnRect.h);
+  if (rpmWarning)
+  {
+    tft.fillRect(warnRect.x, warnRect.y, warnRect.w, min(14, (int)warnRect.h), rpmLockFlash ? ST77XX_RED : ST77XX_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(rpmLockFlash ? ST77XX_WHITE : ST77XX_RED, rpmLockFlash ? ST77XX_RED : ST77XX_BLACK);
+    tft.setCursor(warnRect.x + 10, warnRect.y + 3);
+    tft.print("LOCK");
+  }
+
+  drawDashboardRegion(barRect.x, barRect.y, barRect.w, barRect.h);
+  drawDashboardRegion(valueRect.x, valueRect.y, valueRect.w, valueRect.h);
+
+  int litW = valid ? map(constrain(rpmValue, 0, 16000), 0, 16000, 0, barRect.w) : 0;
+  int coverW = barRect.w - litW;
+  if (coverW > 0)
+  {
+    int coverX = barRect.x + barRect.w - coverW;
+    tft.fillRect(coverX, barRect.y, coverW, barRect.h, ST77XX_BLACK);
+  }
+
+  if (rpmWarning)
+  {
+    tft.drawRect(barRect.x - 1, barRect.y - 1, barRect.w + 2, barRect.h + 2, lockColor);
+    tft.drawFastHLine(barRect.x, barRect.y + barRect.h + 1, barRect.w, lockColor);
+  }
+
+  char buf[12];
+  if (valid)
+    snprintf(buf, sizeof(buf), "%d", rpmValue);
+  else
+    strcpy(buf, "---");
+  drawSevenTextCentered(valueRect.x, valueRect.y, valueRect.w, valueRect.h, buf, 8, 22, 2, 1, valid ? (rpmWarning ? lockColor : ST77XX_GREEN) : DASH_DIM);
+}
+
+void drawGearValue(int gearValue, bool valid)
+{
+  const UiRect &gearRect = uiLayout[UI_GEAR];
+  const UiRect &listRect = uiLayout[UI_GEAR_LIST];
+  drawDashboardRegion(gearRect.x, gearRect.y, gearRect.w, gearRect.h);
+  char buf[4];
+  if (!valid)
+    strcpy(buf, "-");
+  else if (gearValue == 0)
+    strcpy(buf, "N");
+  else
+    snprintf(buf, sizeof(buf), "%d", gearValue);
+  drawSevenTextCentered(gearRect.x, gearRect.y, gearRect.w, gearRect.h, buf, 28, 44, 5, 3, valid ? DASH_PURPLE : DASH_DIM);
+
+  drawDashboardRegion(listRect.x, listRect.y, listRect.w, listRect.h);
+  tft.setTextSize(1);
+  for (int i = 0; i < 7; i++)
+  {
+    int x = listRect.x + i * 8;
+    bool active = valid && ((i == 0 && gearValue == 0) || gearValue == i);
+    if (i == 0)
+    {
+      tft.setTextColor(active ? ST77XX_GREEN : DASH_DIM, ST77XX_BLACK);
+      tft.setCursor(x, listRect.y + 2);
+      tft.print("N");
+    }
+    else
+    {
+      char d[2] = {(char)('0' + i), 0};
+      drawSevenText(x, listRect.y + 2, d, 5, 9, 1, 1, active ? ST77XX_GREEN : DASH_DIM);
+    }
+  }
+}
+
+void drawSpeedValue(int spdValue, bool valid)
+{
+  const UiRect &r = uiLayout[UI_SPEED];
+  drawDashboardRegion(r.x, r.y, r.w, r.h);
+  char buf[8];
+  if (valid)
+    snprintf(buf, sizeof(buf), "%d", spdValue);
+  else
+    strcpy(buf, "---");
+  drawSevenTextCentered(r.x, r.y, r.w, r.h, buf, 30, 52, 6, 4, valid ? ST77XX_WHITE : DASH_DIM);
+}
+
+void drawFullScreenSpeed(int spdValue, bool valid)
+{
+  const uint16_t darkRed = 0x4000;
+  const uint16_t deepRed = 0x7800;
+  const uint16_t panelDark = 0x1082;
+  const uint16_t warnColor = ST77XX_RED;
+
+  tft.fillScreen(ST77XX_BLACK);
+  tft.fillRect(0, 0, 320, 34, darkRed);
+  tft.drawFastHLine(0, 34, 320, warnColor);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE, darkRed);
+  tft.setCursor(12, 9);
+  tft.print("SPEED LIMIT");
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_YELLOW, darkRed);
+  tft.setCursor(224, 7);
+  tft.print("OVER");
+  tft.setCursor(224, 19);
+  tft.print("WARNING");
+
+  for (int i = 0; i < 3; i++)
+  {
+    int x = 284 + i * 10;
+    tft.fillTriangle(x, 8, x, 26, x + 8, 17, ST77XX_YELLOW);
+  }
+
+  drawPanel(8, 42, 304, 122, warnColor);
+
+  char buf[8];
+  if (valid)
+    snprintf(buf, sizeof(buf), "%d", spdValue);
+  else
+    strcpy(buf, "---");
+  drawSevenTextCentered(8, 50, 304, 84, buf, 54, 78, 9, 7, ST77XX_WHITE);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+  tft.setCursor(132, 134);
+  tft.print("km/h");
+
+  int gaugeMax = max(speedFullscreenLimit + 40, 140);
+  int gaugeFill = valid ? map(constrain(spdValue, 0, gaugeMax), 0, gaugeMax, 0, 284) : 0;
+  int limitX = map(constrain(speedFullscreenLimit, 0, gaugeMax), 0, gaugeMax, 18, 302);
+
+  tft.fillRoundRect(18, 174, 284, 18, 4, panelDark);
+  tft.fillRoundRect(18, 174, gaugeFill, 18, 4, deepRed);
+  tft.drawRoundRect(18, 174, 284, 18, 4, DASH_DIM);
+  tft.drawFastVLine(limitX, 169, 28, ST77XX_YELLOW);
+  tft.fillTriangle(limitX - 4, 168, limitX + 4, 168, limitX, 174, ST77XX_YELLOW);
+
+  tft.setTextSize(1);
+  tft.setTextColor(DASH_DIM, ST77XX_BLACK);
+  tft.setCursor(18, 198);
+  tft.print("0");
+  tft.setCursor(278, 198);
+  tft.print(gaugeMax);
+  tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+  tft.setCursor(limitX > 250 ? 232 : limitX + 6, 198);
+  tft.print("LIMIT");
+
+  tft.fillRoundRect(8, 212, 96, 24, 4, panelDark);
+  tft.fillRoundRect(112, 212, 96, 24, 4, panelDark);
+  tft.fillRoundRect(216, 212, 96, 24, 4, panelDark);
+
+  tft.setTextSize(1);
+  tft.setTextColor(DASH_DIM, panelDark);
+  tft.setCursor(16, 216);
+  tft.print("LIMIT");
+  tft.setCursor(120, 216);
+  tft.print("TOP");
+  tft.setCursor(224, 216);
+  tft.print("RPM");
+
+  tft.setTextColor(ST77XX_WHITE, panelDark);
+  char smallBuf[12];
+  snprintf(smallBuf, sizeof(smallBuf), "%d", speedFullscreenLimit);
+  drawSevenTextCentered(50, 216, 48, 16, smallBuf, 7, 13, 1, 1, ST77XX_WHITE);
+  snprintf(smallBuf, sizeof(smallBuf), "%d", topSpeedKmh);
+  drawSevenTextCentered(148, 216, 54, 16, smallBuf, 7, 13, 1, 1, ST77XX_WHITE);
+  if (gotRPM)
+    snprintf(smallBuf, sizeof(smallBuf), "%d", (int)rpm);
+  else
+    strcpy(smallBuf, "---");
+  drawSevenTextCentered(252, 216, 54, 16, smallBuf, 7, 13, 1, 1, ST77XX_WHITE);
+}
+
+void drawTopSpeedValue(int topValue)
+{
+  const UiRect &r = uiLayout[UI_TOP_SPEED];
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d", topValue);
+  drawDashboardRegion(r.x, r.y, r.w, r.h);
+  drawSevenTextCentered(r.x, r.y, r.w, r.h, buf, 14, 34, 3, 2, ST77XX_YELLOW);
+}
+
+void drawSensorValue(int idx, const char *value, const char *unit, uint16_t color, int fill)
+{
+  UiLayoutId ids[5] = {UI_ECT, UI_IAT, UI_MAP, UI_TPS, UI_FUEL};
+  const UiRect &r = uiLayout[ids[idx]];
+  int baseX = idx * 64;
+  drawDashboardRegion(r.x, r.y, r.w, r.h);
+  drawSevenTextCentered(r.x, r.y, r.w, r.h, value, 9, 21, 2, 1, ST77XX_WHITE);
+
+  drawDashboardRegion(baseX + 6, 196, 50, 6);
+  int bar = constrain(fill, 0, 46);
+  tft.fillRect(baseX + 8, 197, bar, 4, color);
+}
+
+void drawStatusBar(bool canAlive)
+{
+  const UiRect &canRect = uiLayout[UI_CAN_STATUS];
+  const UiRect &obdRect = uiLayout[UI_OBD_STATUS];
+  const UiRect &tempRect = uiLayout[UI_TEMP_STATUS];
+  const UiRect &voltRect = uiLayout[UI_VOLTAGE];
+
+  tft.setTextSize(1);
+  drawDashboardRegion(canRect.x, canRect.y, canRect.w, canRect.h);
+  tft.setTextColor(canAlive ? ST77XX_GREEN : ST77XX_RED);
+  tft.setCursor(canRect.x, canRect.y);
+  tft.print(canAlive ? "OK" : "TIMEOUT");
+
+  drawDashboardRegion(obdRect.x, obdRect.y, obdRect.w, obdRect.h);
+  tft.setTextColor(DASH_CYAN);
+  tft.setCursor(obdRect.x, obdRect.y);
+  tft.print(canAlive ? "OK" : "---");
+
+  drawDashboardRegion(tempRect.x, tempRect.y, tempRect.w, tempRect.h);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(tempRect.x, tempRect.y);
+  tft.print(coolantC > 100 ? "HOT" : "NORMAL");
+
+  drawDashboardRegion(voltRect.x, voltRect.y, voltRect.w, voltRect.h);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(voltRect.x, voltRect.y);
+  tft.print("--.- V");
+}
+
+const char *gearTextC()
+{
+  static char buf[4];
+  if (!gotGear)
+    return "---";
+  if (gear == 0)
+    return "N";
+  snprintf(buf, sizeof(buf), "%d", gear);
+  return buf;
+}
+
+void initTFT()
+{
+  deselectAllSPI();
+
+  tft.init(240, 320);
+  tft.setRotation(1);
+  tft.invertDisplay(false);
+  tft.setTextWrap(false);
+
+  drawKtmSplash();
+  delay(1800);
+  drawStaticDashboard();
+  invalidateUiCache();
+}
+
+void updateScreenOptimized(bool force = false)
+{
+  unsigned long now = millis();
+  if (!force && (now - lastScreen < SCREEN_INTERVAL_MS))
+    return;
+  lastScreen = now;
+
+  bool canAlive = (now - lastDataMs) < 2000;
+
+  if (pendingFullRedraw)
+  {
+    speedFullscreenActive = false;
+    drawStaticDashboard();
+    invalidateUiCache();
+    pendingFullRedraw = false;
+    force = true;
+  }
+
+  int rpm_i = gotRPM ? (int)rpm : INVALID_VAL;
+  int spd_i = gotSPD ? speedKmh : INVALID_VAL;
+  int topspd_i = topSpeedKmh;
+  int ect_i = gotECT ? coolantC : INVALID_VAL;
+  int iat_i = gotIAT ? iatC : INVALID_VAL;
+  int map_i = gotMAP ? mapKpa : INVALID_VAL;
+  int gear_i = gotGear ? gear : INVALID_VAL;
+  int tps10_i = gotTPS ? (int)(tpsPercent * 10.0f + 0.5f) : INVALID_VAL;
+  int fuel10_i = gotFuel ? (int)(fuelPercent * 10.0f + 0.5f) : INVALID_VAL;
+  int can_i = canAlive ? 1 : 0;
+  bool rpmLockActive = gotRPM && rpm_i >= rpmRedLimit;
+  bool rpmLockFlashChanged = false;
+
+  if (rpmLockActive)
+  {
+    if (now - lastRpmLockFlashMs >= RPM_LOCK_FLASH_MS)
+    {
+      rpmLockFlash = !rpmLockFlash;
+      lastRpmLockFlashMs = now;
+      rpmLockFlashChanged = true;
+    }
+  }
+  else if (rpmLockFlash)
+  {
+    rpmLockFlash = false;
+    rpmLockFlashChanged = true;
+  }
+  if (rpmLockActive != rpmLockActiveLast)
+  {
+    rpmLockFlashChanged = true;
+    rpmLockActiveLast = rpmLockActive;
+  }
+
+  char buf[20];
+
+  deselectAllSPI();
+
+  bool speedFullscreen = gotSPD && speedKmh > speedFullscreenLimit;
+  if (speedFullscreen)
+  {
+    if (!speedFullscreenActive || needsRedraw(uiCache.spd, spd_i, SPD_REDRAW_DELTA, force))
+    {
+      drawFullScreenSpeed(spd_i, gotSPD);
+      uiCache.spd = spd_i;
+    }
+    speedFullscreenActive = true;
+    return;
+  }
+
+  if (speedFullscreenActive)
+  {
+    speedFullscreenActive = false;
+    drawStaticDashboard();
+    invalidateUiCache();
+    force = true;
+  }
+
+  if (rpmLockFlashChanged || needsRedraw(uiCache.rpm, rpm_i, RPM_REDRAW_DELTA, force))
+  {
+    drawRpmBar(rpm_i, gotRPM);
+    uiCache.rpm = rpm_i;
+  }
+
+  if (needsRedraw(uiCache.spd, spd_i, SPD_REDRAW_DELTA, force))
+  {
+    drawSpeedValue(spd_i, gotSPD);
+    uiCache.spd = spd_i;
+  }
+
+  if (force || uiCache.gear != gear_i)
+  {
+    drawGearValue(gear, gotGear);
+    uiCache.gear = gear_i;
+  }
+
+  if (needsRedraw(uiCache.ect, ect_i, TEMP_REDRAW_DELTA, force))
+  {
+    if (gotECT)
+      snprintf(buf, sizeof(buf), "%d", ect_i);
+    else
+      strcpy(buf, "---");
+    drawSensorValue(0, buf, "C", DASH_CYAN, gotECT ? map(constrain(ect_i, 40, 120), 40, 120, 0, 46) : 0);
+    uiCache.ect = ect_i;
+  }
+
+  if (needsRedraw(uiCache.iat, iat_i, TEMP_REDRAW_DELTA, force))
+  {
+    if (gotIAT)
+      snprintf(buf, sizeof(buf), "%d", iat_i);
+    else
+      strcpy(buf, "---");
+    drawSensorValue(1, buf, "C", DASH_CYAN, gotIAT ? map(constrain(iat_i, 0, 80), 0, 80, 0, 46) : 0);
+    uiCache.iat = iat_i;
+  }
+
+  if (needsRedraw(uiCache.map, map_i, MAP_REDRAW_DELTA, force))
+  {
+    if (gotMAP)
+      snprintf(buf, sizeof(buf), "%d", map_i);
+    else
+      strcpy(buf, "---");
+    drawSensorValue(2, buf, "kPa", DASH_CYAN, gotMAP ? map(constrain(map_i, 0, 120), 0, 120, 0, 46) : 0);
+    uiCache.map = map_i;
+  }
+
+  if (needsRedraw(uiCache.tps10, tps10_i, TPS_REDRAW_DELTA10, force))
+  {
+    if (gotTPS)
+      snprintf(buf, sizeof(buf), "%d.%d", tps10_i / 10, abs(tps10_i % 10));
+    else
+      strcpy(buf, "---");
+    drawSensorValue(3, buf, "%", ST77XX_GREEN, gotTPS ? map(constrain(tps10_i, 0, 1000), 0, 1000, 0, 46) : 0);
+    uiCache.tps10 = tps10_i;
+  }
+
+  if (needsRedraw(uiCache.fuel10, fuel10_i, FUEL_REDRAW_DELTA10, force))
+  {
+    if (gotFuel)
+      snprintf(buf, sizeof(buf), "%d.%d", fuel10_i / 10, abs(fuel10_i % 10));
+    else
+      strcpy(buf, "---");
+    drawSensorValue(4, buf, "%", DASH_ORANGE, gotFuel ? map(constrain(fuel10_i, 0, 1000), 0, 1000, 0, 46) : 0);
+    uiCache.fuel10 = fuel10_i;
+  }
+  if (needsRedraw(uiCache.topspd, topspd_i, SPD_REDRAW_DELTA, force))
+  {
+    drawTopSpeedValue(topspd_i);
+    uiCache.topspd = topspd_i;
+  }
+  if (force || uiCache.canAlive != can_i)
+  {
+    drawStatusBar(canAlive);
+    uiCache.canAlive = can_i;
+  }
+}
+// =========================
+// CAN / OBD
+// =========================
+void sendOBDRequest(uint8_t pid)
+{
+  txFrame.can_id = 0x7DF;
+  txFrame.can_dlc = 8;
+  txFrame.data[0] = 0x02;
+  txFrame.data[1] = 0x01;
+  txFrame.data[2] = pid;
+  txFrame.data[3] = 0x00;
+  txFrame.data[4] = 0x00;
+  txFrame.data[5] = 0x00;
+  txFrame.data[6] = 0x00;
+  txFrame.data[7] = 0x00;
+  mcp2515.sendMessage(&txFrame);
+}
+
+void requestScheduler()
+{
+  unsigned long now = millis();
+
+  if (now - lastReqAny < MIN_OBD_REQ_GAP_MS)
+    return;
+
+  if (now - lastReqRPM >= RPM_REQ_MS)
+  {
+    deselectAllSPI();
+    sendOBDRequest(PID_RPM);
+    lastReqRPM = now;
+    lastReqAny = now;
+    return;
+  }
+
+  if (now - lastReqSPD >= SPD_REQ_MS)
+  {
+    deselectAllSPI();
+    sendOBDRequest(PID_SPD);
+    lastReqSPD = now;
+    lastReqAny = now;
+    return;
+  }
+
+  if (now - lastReqTPS >= TPS_REQ_MS)
+  {
+    deselectAllSPI();
+    sendOBDRequest(PID_TPS);
+    lastReqTPS = now;
+    lastReqAny = now;
+    return;
+  }
+
+  if (now - lastReqSlow >= SLOW_REQ_MS)
+  {
+    deselectAllSPI();
+    if (slowIdx == 0)
+      sendOBDRequest(PID_ECT);
+    else if (slowIdx == 1)
+      sendOBDRequest(PID_IAT);
+    else
+      sendOBDRequest(PID_MAP);
+
+    slowIdx++;
+    if (slowIdx >= 3)
+      slowIdx = 0;
+    lastReqSlow = now;
+    lastReqAny = now;
+    return;
+  }
+
+  if (now - lastReqFuel >= FUEL_REQ_MS)
+  {
+    deselectAllSPI();
+    sendOBDRequest(PID_FUEL);
+    lastReqFuel = now;
+    lastReqAny = now;
+    return;
+  }
+}
+
+void decodeOBD(const can_frame &f)
+{
+  if (f.can_id < 0x7E8 || f.can_id > 0x7EF)
+    return;
+  if (f.can_dlc < 4)
+    return;
+  if (f.data[1] != 0x41)
+    return;
+
+  uint8_t pid = f.data[2];
+  lastDataMs = millis();
+
+  switch (pid)
+  {
+  case PID_RPM:
+    if (f.can_dlc >= 5)
+    {
+      int A = f.data[3];
+      int B = f.data[4];
+      rpm = ((A * 256.0f) + B) / 4.0f;
+      gotRPM = true;
+    }
+    break;
+
+  case PID_SPD:
+    speedKmh = f.data[3];
+    if (speedKmh > topSpeedKmh)
+      topSpeedKmh = speedKmh;
+    gotSPD = true;
+    break;
+
+  case PID_ECT:
+    coolantC = (int)f.data[3] - 40;
+    gotECT = true;
+    break;
+
+  case PID_IAT:
+    iatC = (int)f.data[3] - 40;
+    gotIAT = true;
+    break;
+
+  case PID_MAP:
+    mapKpa = f.data[3];
+    gotMAP = true;
+    break;
+
+  case PID_TPS:
+  {
+    tpsRawPercent = f.data[3] * 100.0f / 255.0f;
+
+    tpsPercent =
+        (tpsRawPercent - tpsCalMin) *
+        100.0f /
+        (tpsCalMax - tpsCalMin);
+
+    if (tpsPercent < 0)
+      tpsPercent = 0;
+    if (tpsPercent > 100)
+      tpsPercent = 100;
+
+    gotTPS = true;
+  }
+  break;
+
+  case PID_FUEL:
+    fuelPercent = f.data[3] * 100.0f / 255.0f;
+    gotFuel = true;
+    break;
+  }
+}
+
+void decodeCustomFrames(const can_frame &f)
+{
+  if (f.can_id != 0x540 || f.can_dlc < 8)
+    return;
+
+  if (f.data[0] == 0x02 && f.data[6] == 0x01)
+  {
+    uint8_t v = f.data[3];
+
+    if (v >= 1 && v <= 6)
+    {
+      gear = v;
+      gotGear = true;
+      neutralCandidateMs = 0;
+      lastGearMs = millis();
+      return;
+    }
+
+    if (v == 0 && speedKmh == 0)
+    {
+      if (neutralCandidateMs == 0)
+      {
+        neutralCandidateMs = millis();
+      }
+      else if (millis() - neutralCandidateMs >= NEUTRAL_DEBOUNCE_MS)
+      {
+        gear = 0;
+        gotGear = true;
+        lastGearMs = millis();
+      }
+      return;
+    }
+  }
+
+  if ((f.data[0] == 0x04 || f.data[0] == 0x06) && speedKmh == 0)
+  {
+    if (neutralCandidateMs == 0)
+      neutralCandidateMs = millis();
+    return;
+  }
+
+  neutralCandidateMs = 0;
+}
+
+// =========================
+// Web handlers
+// =========================
+void loadConfig()
+{
+  prefs.begin("rc390", false);
+  rpmRedLimit = prefs.getInt("rpmLimit", DEFAULT_RPM_RED_LIMIT);
+  speedFullscreenLimit = prefs.getInt("spdLimit", DEFAULT_SPEED_FULLSCREEN_LIMIT);
+  tpsCalMin = prefs.getFloat("tpsMin", DEFAULT_TPS_MIN);
+  tpsCalMax = prefs.getFloat("tpsMax", DEFAULT_TPS_MAX);
+  rpmRedLimit = constrain(rpmRedLimit, 1000, 16000);
+  speedFullscreenLimit = constrain(speedFullscreenLimit, 1, 300);
+  normalizeTpsCalibration();
+  loadLayoutConfig();
+}
+
+String configJson(bool tpsCalOk = true)
+{
+  String json = "{";
+  json += "\"rpmLimit\":" + String(rpmRedLimit) + ",";
+  json += "\"speedLimit\":" + String(speedFullscreenLimit) + ",";
+  json += "\"tpsMin\":" + String(tpsCalMin, 1) + ",";
+  json += "\"tpsMax\":" + String(tpsCalMax, 1) + ",";
+  json += "\"tpsCalOk\":" + String(tpsCalOk ? "true" : "false") + ",";
+  appendLayoutJson(json, false);
+  json += ",\"layoutDefault\":";
+  appendLayoutItemsJson(json, true);
+  json += "}";
+  return json;
+}
+
+void handleRoot()
+{
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void putLe16(uint8_t *buf, int idx, uint16_t value)
+{
+  buf[idx] = value & 0xFF;
+  buf[idx + 1] = (value >> 8) & 0xFF;
+}
+
+void putLe32(uint8_t *buf, int idx, uint32_t value)
+{
+  buf[idx] = value & 0xFF;
+  buf[idx + 1] = (value >> 8) & 0xFF;
+  buf[idx + 2] = (value >> 16) & 0xFF;
+  buf[idx + 3] = (value >> 24) & 0xFF;
+}
+
+void handleBackgroundBmp()
+{
+  const uint16_t w = DASHBOARD_BG_W;
+  const uint16_t h = DASHBOARD_BG_H;
+  const uint16_t rowBytes = w * 3;
+  const uint32_t pixelBytes = (uint32_t)rowBytes * h;
+  const uint32_t fileBytes = 54 + pixelBytes;
+
+  uint8_t header[54] = {0};
+  header[0] = 'B';
+  header[1] = 'M';
+  putLe32(header, 2, fileBytes);
+  putLe32(header, 10, 54);
+  putLe32(header, 14, 40);
+  putLe32(header, 18, w);
+  putLe32(header, 22, h);
+  putLe16(header, 26, 1);
+  putLe16(header, 28, 24);
+  putLe32(header, 34, pixelBytes);
+
+  server.setContentLength(fileBytes);
+  server.send(200, "image/bmp", "");
+  server.sendContent((const char *)header, sizeof(header));
+
+  static uint8_t row[320 * 3];
+  for (int y = h - 1; y >= 0; y--)
+  {
+    for (int x = 0; x < w; x++)
+    {
+      uint16_t c = pgm_read_word(&DASHBOARD_BG_BITMAP[y * w + x]);
+      uint8_t r = ((c >> 11) & 0x1F) * 255 / 31;
+      uint8_t g = ((c >> 5) & 0x3F) * 255 / 63;
+      uint8_t b = (c & 0x1F) * 255 / 31;
+      int idx = x * 3;
+      row[idx] = b;
+      row[idx + 1] = g;
+      row[idx + 2] = r;
+    }
+    server.sendContent((const char *)row, rowBytes);
+  }
+}
+
+void handleApiConfig()
+{
+  bool tpsCalOk = true;
+
+  if (server.method() == HTTP_POST)
+  {
+    bool layoutChanged = false;
+    if (server.hasArg("rpmLimit"))
+      rpmRedLimit = constrain(server.arg("rpmLimit").toInt(), 1000, 16000);
+    if (server.hasArg("speedLimit"))
+      speedFullscreenLimit = constrain(server.arg("speedLimit").toInt(), 1, 300);
+    if (server.hasArg("tpsMin"))
+      tpsCalMin = server.arg("tpsMin").toFloat();
+    if (server.hasArg("tpsMax"))
+      tpsCalMax = server.arg("tpsMax").toFloat();
+    if (server.hasArg("tpsCalibrate"))
+    {
+      if (gotTPS)
+      {
+        String point = server.arg("tpsCalibrate");
+        if (point == "min")
+          tpsCalMin = tpsRawPercent;
+        else if (point == "max")
+          tpsCalMax = tpsRawPercent;
+      }
+      else
+      {
+        tpsCalOk = false;
+      }
+    }
+    if (server.hasArg("layoutReset"))
+    {
+      resetLayoutDefaults();
+      layoutChanged = true;
+    }
+    for (int i = 0; i < UI_LAYOUT_COUNT; i++)
+    {
+      String xKey = String("x_") + UI_LAYOUT_DEFS[i].id;
+      String yKey = String("y_") + UI_LAYOUT_DEFS[i].id;
+      String wKey = String("w_") + UI_LAYOUT_DEFS[i].id;
+      String hKey = String("h_") + UI_LAYOUT_DEFS[i].id;
+      if (server.hasArg(xKey) && server.hasArg(yKey))
+      {
+        uiLayout[i].x = server.arg(xKey).toInt();
+        uiLayout[i].y = server.arg(yKey).toInt();
+        if (server.hasArg(wKey))
+          uiLayout[i].w = server.arg(wKey).toInt();
+        if (server.hasArg(hKey))
+          uiLayout[i].h = server.arg(hKey).toInt();
+        clampUiRect(uiLayout[i]);
+        layoutChanged = true;
+      }
+    }
+
+    normalizeTpsCalibration();
+
+    prefs.putInt("rpmLimit", rpmRedLimit);
+    prefs.putInt("spdLimit", speedFullscreenLimit);
+    prefs.putFloat("tpsMin", tpsCalMin);
+    prefs.putFloat("tpsMax", tpsCalMax);
+    if (layoutChanged)
+    {
+      saveLayoutConfig();
+      pendingFullRedraw = true;
+    }
+    invalidateUiCache();
+  }
+
+  server.send(200, "application/json", configJson(tpsCalOk));
+}
+
+void handleApiData()
+{
+  bool canAlive = (millis() - lastDataMs) < 2000;
+
+  String json = "{";
+  json += "\"rpm\":" + String((int)rpm) + ",";
+  json += "\"speed\":" + String(speedKmh) + ",";
+  json += "\"coolant\":" + String(coolantC) + ",";
+  json += "\"iat\":" + String(iatC) + ",";
+  json += "\"map\":" + String(mapKpa) + ",";
+  json += "\"tpsRaw\":" + String(tpsRawPercent, 1) + ",";
+  json += "\"tps\":" + String(tpsPercent, 1) + ",";
+  json += "\"fuel\":" + String(fuelPercent, 1) + ",";
+  json += "\"gear\":" + String(gear) + ",";
+  json += "\"gotRPM\":" + String(gotRPM ? "true" : "false") + ",";
+  json += "\"gotSPD\":" + String(gotSPD ? "true" : "false") + ",";
+  json += "\"gotECT\":" + String(gotECT ? "true" : "false") + ",";
+  json += "\"gotIAT\":" + String(gotIAT ? "true" : "false") + ",";
+  json += "\"gotMAP\":" + String(gotMAP ? "true" : "false") + ",";
+  json += "\"gotTPS\":" + String(gotTPS ? "true" : "false") + ",";
+  json += "\"gotFuel\":" + String(gotFuel ? "true" : "false") + ",";
+  json += "\"gotGear\":" + String(gotGear ? "true" : "false") + ",";
+  json += "\"canAlive\":" + String(canAlive ? "true" : "false") + ",";
+  json += "\"rpmLimit\":" + String(rpmRedLimit) + ",";
+  json += "\"speedLimit\":" + String(speedFullscreenLimit) + ",";
+  json += "\"tpsMin\":" + String(tpsCalMin, 1) + ",";
+  json += "\"tpsMax\":" + String(tpsCalMax, 1) + ",";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleNotFound()
+{
+  server.send(404, "text/plain", "Not found");
+}
+
+// =========================
+// Setup DEBUG
+// =========================
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  dbg("STEP 1: boot ok");
+
+  pinMode(CAN_CS, OUTPUT);
+  pinMode(TFT_CS, OUTPUT);
+  pinMode(TOUCH_CS, OUTPUT);
+  pinMode(SD_CS, OUTPUT);
+
+  digitalWrite(CAN_CS, HIGH);
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TOUCH_CS, HIGH);
+  digitalWrite(SD_CS, HIGH);
+
+  dbg("STEP 2: pin ok");
+
+  loadConfig();
+  dbg("STEP 2B: config ok");
+
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
+  dbg("STEP 3: SPI ok");
+
+  dbg("STEP 4: before TFT");
+  initTFT();
+  dbg("STEP 5: after TFT");
+
+  updateScreenOptimized(true);
+  dbg("STEP 6: screen drawn");
+
+  dbg("STEP 7: before MCP reset");
+  deselectAllSPI();
+  mcp2515.reset();
+  dbg("STEP 8: after MCP reset");
+
+  mcp2515.setBitrate(CAN_SPEED, MCP_CLOCK);
+  dbg("STEP 9: bitrate ok");
+
+  mcp2515.setNormalMode();
+  dbg("STEP 10: normal mode ok");
+
+  WiFi.mode(WIFI_AP);
+  IPAddress local_ip(192, 168, 1, 82);
+  IPAddress gateway(192, 168, 1, 82);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_ip, gateway, subnet);
+  dbg("STEP 11: wifi config ok");
+
+  bool apOk;
+  if (strlen(AP_PASS) >= 8)
+    apOk = WiFi.softAP(AP_SSID, AP_PASS);
+  else
+    apOk = WiFi.softAP(AP_SSID);
+
+  if (apOk)
+    dbg("STEP 12: hotspot started");
+  else
+    dbg("STEP 12: hotspot failed");
+
+  server.on("/", handleRoot);
+  server.on("/background.bmp", handleBackgroundBmp);
+  server.on("/api/data", handleApiData);
+  server.on("/api/config", handleApiConfig);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  dbg("STEP 13: web ok");
+  dbg("SETUP DONE");
+}
+
+// =========================
+// Loop
+// =========================
+void loop()
+{
+  server.handleClient();
+
+  deselectAllSPI();
+  while (mcp2515.readMessage(&rxFrame) == MCP2515::ERROR_OK)
+  {
+    decodeOBD(rxFrame);
+    decodeCustomFrames(rxFrame);
+  }
+
+  requestScheduler();
+
+  if (gotGear && (millis() - lastGearMs > GEAR_HOLD_MS))
+  {
+    // giu gia tri cu
+  }
+
+  updateScreenOptimized();
+
+  if (millis() - lastPrint >= 1000)
+  {
+    Serial.print("RPM=");
+    Serial.print(gotRPM ? String((int)rpm) : "---");
+    Serial.print(" | SPD=");
+    Serial.print(gotSPD ? String(speedKmh) : "---");
+    Serial.print(" | ECT=");
+    Serial.print(gotECT ? String(coolantC) : "---");
+    Serial.print(" | IAT=");
+    Serial.print(gotIAT ? String(iatC) : "---");
+    Serial.print(" | MAP=");
+    Serial.print(gotMAP ? String(mapKpa) : "---");
+    Serial.print(" | TPS=");
+    Serial.print(gotTPS ? String(tpsPercent, 1) : "---");
+    Serial.print(" | FUEL=");
+    Serial.print(gotFuel ? String(fuelPercent, 1) : "---");
+    Serial.print(" | GEAR=");
+    Serial.println(gearTextC());
+
+    lastPrint = millis();
+  }
+}

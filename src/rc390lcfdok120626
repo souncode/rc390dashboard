@@ -1,0 +1,1371 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <SPI.h>
+#include <mcp2515.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+
+// =========================
+// Hotspot
+// =========================
+const char *AP_SSID = "RC390-Monitor";
+const char *AP_PASS = "";
+
+// =========================
+// SPI chung
+// =========================
+#define SPI_SCK 18
+#define SPI_MISO 19
+#define SPI_MOSI 23
+
+// =========================
+// MCP2515
+// =========================
+#define CAN_CS 5
+#define CAN_INT 4
+#define MCP_CLOCK MCP_8MHZ
+#define CAN_SPEED CAN_500KBPS
+
+MCP2515 mcp2515(CAN_CS);
+struct can_frame txFrame;
+struct can_frame rxFrame;
+
+// =========================
+// TFT / TOUCH / SD
+// =========================
+#define TFT_CS 14
+#define TFT_DC 27
+#define TFT_RST 26
+
+#define TOUCH_CS 33
+#define TOUCH_IRQ 32
+
+#define SD_CS 13
+
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+
+// =========================
+// Web
+// =========================
+WebServer server(80);
+Preferences prefs;
+
+// =========================
+// User config
+// =========================
+const int DEFAULT_RPM_RED_LIMIT = 8500;
+const int DEFAULT_SPEED_FULLSCREEN_LIMIT = 100;
+const float DEFAULT_TPS_MIN = 10.2f;
+const float DEFAULT_TPS_MAX = 85.5f;
+int rpmRedLimit = DEFAULT_RPM_RED_LIMIT;
+int speedFullscreenLimit = DEFAULT_SPEED_FULLSCREEN_LIMIT;
+float tpsCalMin = DEFAULT_TPS_MIN;
+float tpsCalMax = DEFAULT_TPS_MAX;
+
+// =========================
+// OBD PID
+// =========================
+const uint8_t PID_RPM = 0x0C;
+const uint8_t PID_SPD = 0x0D;
+const uint8_t PID_ECT = 0x05;
+const uint8_t PID_IAT = 0x0F;
+const uint8_t PID_MAP = 0x0B;
+const uint8_t PID_TPS = 0x11;
+const uint8_t PID_FUEL = 0x2F;
+
+// =========================
+// Data
+// =========================
+volatile float rpm = 0;
+volatile int speedKmh = 0;
+volatile int topSpeedKmh = 0;
+volatile int coolantC = 0;
+volatile int iatC = 0;
+volatile int mapKpa = 0;
+volatile float tpsRawPercent = 0;
+volatile float tpsPercent = 0;
+volatile float fuelPercent = 0;
+volatile int gear = -1;
+
+volatile bool gotRPM = false;
+volatile bool gotSPD = false;
+volatile bool gotECT = false;
+volatile bool gotIAT = false;
+volatile bool gotMAP = false;
+volatile bool gotTPS = false;
+volatile bool gotFuel = false;
+volatile bool gotGear = false;
+
+unsigned long lastDataMs = 0;
+unsigned long lastPrint = 0;
+unsigned long lastScreen = 0;
+
+// =========================
+// Request scheduler
+// Uu tien RPM, speed, TPS va tranh gui request theo cum.
+// =========================
+unsigned long lastReqRPM = 0;
+unsigned long lastReqSPD = 0;
+unsigned long lastReqTPS = 0;
+unsigned long lastReqSlow = 0;
+unsigned long lastReqFuel = 0;
+unsigned long lastReqAny = 0;
+
+uint8_t slowIdx = 0; // ECT, IAT, MAP
+
+const uint16_t MIN_OBD_REQ_GAP_MS = 8;
+const uint16_t RPM_REQ_MS = 28;
+const uint16_t SPD_REQ_MS = 45;
+const uint16_t TPS_REQ_MS = 55;
+const uint16_t SLOW_REQ_MS = 450;
+const uint16_t FUEL_REQ_MS = 1800;
+
+// =========================
+// Gear filter
+// =========================
+unsigned long neutralCandidateMs = 0;
+const unsigned long NEUTRAL_DEBOUNCE_MS = 120;
+unsigned long lastGearMs = 0;
+const unsigned long GEAR_HOLD_MS = 1500;
+
+// =========================
+// UI cache
+// =========================
+const uint16_t SCREEN_INTERVAL_MS = 80;
+
+const int INVALID_VAL = -100000;
+
+const int RPM_REDRAW_DELTA = 50;
+const int SPD_REDRAW_DELTA = 1;
+const int TEMP_REDRAW_DELTA = 1;
+const int MAP_REDRAW_DELTA = 1;
+const int TPS_REDRAW_DELTA10 = 3;  // 0.3%
+const int FUEL_REDRAW_DELTA10 = 5; // 0.5%
+
+struct UiCache
+{
+  int rpm = INVALID_VAL;
+  int spd = INVALID_VAL;
+  int ect = INVALID_VAL;
+  int iat = INVALID_VAL;
+  int map = INVALID_VAL;
+  int gear = INVALID_VAL;
+  int tps10 = INVALID_VAL;
+  int fuel10 = INVALID_VAL;
+  int topspd = INVALID_VAL;
+
+  int canAlive = -1;
+} uiCache;
+
+bool speedFullscreenActive = false;
+
+// =========================
+// HTML
+// =========================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>RC390 Monitor</title>
+  <style>
+    body { margin:0; background:#111; color:#eee; font-family:Arial,sans-serif; }
+    .wrap { max-width:1000px; margin:0 auto; padding:16px; }
+    .title { font-size:28px; font-weight:bold; margin-bottom:12px; }
+    .status { margin-bottom:16px; padding:10px 14px; border-radius:10px; background:#1c1c1c; font-size:14px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; }
+    .card { background:#1c1c1c; border-radius:14px; padding:16px; box-shadow:0 0 10px rgba(0,0,0,0.25); }
+    .label { font-size:14px; color:#bbb; margin-bottom:8px; }
+    .value { font-size:34px; font-weight:bold; }
+    .unit { font-size:16px; color:#aaa; margin-left:6px; }
+    .big { grid-column:span 2; }
+    .config { margin-top:16px; display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; }
+    .field { display:flex; flex-direction:column; gap:6px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; align-items:end; }
+    input { background:#111; color:#eee; border:1px solid #444; border-radius:8px; padding:10px; font-size:18px; }
+    button { align-self:end; background:#f57c00; color:#111; border:0; border-radius:8px; padding:11px 18px; font-weight:bold; cursor:pointer; }
+    .secondary { background:#333; color:#eee; border:1px solid #555; }
+    button:active { transform:translateY(1px); }
+    @media (max-width:700px){ .big { grid-column:span 1; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">RC390 CAN Monitor</div>
+    <div class="status" id="status">Connecting...</div>
+
+    <div class="grid">
+      <div class="card big">
+        <div class="label">RPM</div>
+        <div class="value"><span id="rpm">---</span><span class="unit">rpm</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Speed</div>
+        <div class="value"><span id="speed">---</span><span class="unit">km/h</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">TPS</div>
+        <div class="value"><span id="tps">---</span><span class="unit">%</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Coolant</div>
+        <div class="value"><span id="coolant">---</span><span class="unit">°C</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">IAT</div>
+        <div class="value"><span id="iat">---</span><span class="unit">°C</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">MAP</div>
+        <div class="value"><span id="map">---</span><span class="unit">kPa</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Fuel</div>
+        <div class="value"><span id="fuel">---</span><span class="unit">%</span></div>
+      </div>
+
+      <div class="card">
+        <div class="label">Gear</div>
+        <div class="value"><span id="gear">---</span></div>
+      </div>
+    </div>
+
+    <div class="card config">
+      <div class="field">
+        <label class="label" for="rpmLimit">RPM red limit</label>
+        <input id="rpmLimit" type="number" min="1000" max="16000" step="100">
+      </div>
+      <div class="field">
+        <label class="label" for="speedLimit">Speed fullscreen limit</label>
+        <input id="speedLimit" type="number" min="1" max="300" step="1">
+      </div>
+      <div class="field">
+        <label class="label">TPS raw</label>
+        <div class="value"><span id="tpsRaw">---</span><span class="unit">%</span></div>
+      </div>
+      <div class="field">
+        <label class="label" for="tpsMin">TPS 0% raw</label>
+        <input id="tpsMin" type="number" min="0" max="100" step="0.1">
+      </div>
+      <div class="field">
+        <label class="label" for="tpsMax">TPS 100% raw</label>
+        <input id="tpsMax" type="number" min="0" max="100" step="0.1">
+      </div>
+      <div class="actions">
+        <button class="secondary" onclick="calibrateTps('min')">Set 0%</button>
+        <button class="secondary" onclick="calibrateTps('max')">Set 100%</button>
+      </div>
+      <button onclick="saveConfig()">Save</button>
+    </div>
+  </div>
+
+<script>
+let configLoaded = false;
+
+async function loadData() {
+  try {
+    const res = await fetch('/api/data?_=' + Date.now());
+    const d = await res.json();
+
+    document.getElementById('rpm').textContent = d.gotRPM ? d.rpm : '---';
+    document.getElementById('speed').textContent = d.gotSPD ? d.speed : '---';
+    document.getElementById('tps').textContent = d.gotTPS ? d.tps : '---';
+    document.getElementById('tpsRaw').textContent = d.gotTPS ? d.tpsRaw : '---';
+    document.getElementById('coolant').textContent = d.gotECT ? d.coolant : '---';
+    document.getElementById('iat').textContent = d.gotIAT ? d.iat : '---';
+    document.getElementById('map').textContent = d.gotMAP ? d.map : '---';
+    document.getElementById('fuel').textContent = d.gotFuel ? d.fuel : '---';
+    document.getElementById('gear').textContent =
+      d.gotGear ? (d.gear === 0 ? 'N' : d.gear) : '---';
+
+    let statusText = "Hotspot OK | ";
+    statusText += d.canAlive ? "CAN OK" : "CAN timeout";
+    statusText += " | IP: " + d.ip;
+    document.getElementById('status').textContent = statusText;
+
+    if (!configLoaded) {
+      document.getElementById('rpmLimit').value = d.rpmLimit;
+      document.getElementById('speedLimit').value = d.speedLimit;
+      document.getElementById('tpsMin').value = d.tpsMin;
+      document.getElementById('tpsMax').value = d.tpsMax;
+      configLoaded = true;
+    }
+  } catch (e) {
+    document.getElementById('status').textContent = 'Web update error';
+  }
+}
+
+async function saveConfig() {
+  const body = new URLSearchParams({
+    rpmLimit: document.getElementById('rpmLimit').value,
+    speedLimit: document.getElementById('speedLimit').value,
+    tpsMin: document.getElementById('tpsMin').value,
+    tpsMax: document.getElementById('tpsMax').value
+  });
+  const res = await fetch('/api/config', { method:'POST', body });
+  const d = await res.json();
+  document.getElementById('rpmLimit').value = d.rpmLimit;
+  document.getElementById('speedLimit').value = d.speedLimit;
+  document.getElementById('tpsMin').value = d.tpsMin;
+  document.getElementById('tpsMax').value = d.tpsMax;
+  document.getElementById('status').textContent = 'Saved limits';
+}
+
+async function calibrateTps(point) {
+  const body = new URLSearchParams({ tpsCalibrate: point });
+  const res = await fetch('/api/config', { method:'POST', body });
+  const d = await res.json();
+  document.getElementById('tpsMin').value = d.tpsMin;
+  document.getElementById('tpsMax').value = d.tpsMax;
+  document.getElementById('status').textContent = d.tpsCalOk ? 'TPS calibration saved' : 'TPS raw not ready';
+}
+
+loadData();
+setInterval(loadData, 300);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =========================
+// Debug helper
+// =========================
+void dbg(const char *s)
+{
+  Serial.println(s);
+  Serial.flush();
+  delay(50);
+}
+
+// =========================
+// SPI helpers
+// =========================
+void deselectAllSPI()
+{
+  digitalWrite(CAN_CS, HIGH);
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TOUCH_CS, HIGH);
+  digitalWrite(SD_CS, HIGH);
+}
+
+// =========================
+// TFT helpers
+// =========================
+bool needsRedraw(int oldVal, int newVal, int delta, bool force = false)
+{
+  if (force)
+    return true;
+  if (oldVal == INVALID_VAL || newVal == INVALID_VAL)
+    return oldVal != newVal;
+  return abs(newVal - oldVal) >= delta;
+}
+
+void invalidateUiCache()
+{
+  uiCache = UiCache();
+}
+
+float clampFloat(float value, float minValue, float maxValue)
+{
+  if (value < minValue)
+    return minValue;
+  if (value > maxValue)
+    return maxValue;
+  return value;
+}
+
+void normalizeTpsCalibration()
+{
+  tpsCalMin = clampFloat(tpsCalMin, 0.0f, 100.0f);
+  tpsCalMax = clampFloat(tpsCalMax, 0.0f, 100.0f);
+  if (tpsCalMin > 99.0f)
+    tpsCalMin = 99.0f;
+  if (tpsCalMax < tpsCalMin + 1.0f)
+    tpsCalMax = tpsCalMin + 1.0f;
+}
+
+const uint16_t DASH_BLUE = 0x041F;
+const uint16_t DASH_CYAN = 0x07FF;
+const uint16_t DASH_DIM = 0x3186;
+const uint16_t DASH_DARK_BLUE = 0x0010;
+const uint16_t DASH_ORANGE = 0xFD20;
+const uint16_t DASH_PURPLE = 0xA01F;
+
+void printCentered(int x, int y, int w, int h, const char *text, uint16_t color, uint8_t size)
+{
+  tft.setTextSize(size);
+  tft.setTextColor(color, ST77XX_BLACK);
+
+  int16_t x1, y1;
+  uint16_t tw, th;
+  tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
+
+  int tx = x + (w - tw) / 2;
+  int ty = y + (h - th) / 2;
+  if (tx < x + 2)
+    tx = x + 2;
+  if (ty < y + 2)
+    ty = y + 2;
+
+  tft.setCursor(tx, ty);
+  tft.print(text);
+}
+
+void drawPanel(int x, int y, int w, int h, uint16_t color)
+{
+  const int c = 5;
+  tft.fillRect(x + 1, y + 1, w - 2, h - 2, ST77XX_BLACK);
+  tft.drawLine(x + c, y, x + w - c - 1, y, color);
+  tft.drawLine(x + w - 1, y + c, x + w - 1, y + h - c - 1, color);
+  tft.drawLine(x + c, y + h - 1, x + w - c - 1, y + h - 1, color);
+  tft.drawLine(x, y + c, x, y + h - c - 1, color);
+  tft.drawLine(x, y + c, x + c, y, color);
+  tft.drawLine(x + w - c - 1, y, x + w - 1, y + c, color);
+  tft.drawLine(x + w - 1, y + h - c - 1, x + w - c - 1, y + h - 1, color);
+  tft.drawLine(x + c, y + h - 1, x, y + h - c - 1, color);
+}
+
+void fillQuad(int x0, int y0, int x1, int y1, int x2, int y2, int x3, int y3, uint16_t color)
+{
+  tft.fillTriangle(x0, y0, x1, y1, x2, y2, color);
+  tft.fillTriangle(x0, y0, x2, y2, x3, y3, color);
+}
+
+void fillQuadHalfLogo(int x0, int y0, int x1, int y1, int x2, int y2, int x3, int y3, uint16_t color)
+{
+  const int ox = 80;
+  const int oy = 34;
+  fillQuad(
+      ox + x0 / 2, oy + y0 / 2,
+      ox + x1 / 2, oy + y1 / 2,
+      ox + x2 / 2, oy + y2 / 2,
+      ox + x3 / 2, oy + y3 / 2,
+      color);
+}
+
+void drawKtmSplash()
+{
+  const uint16_t ktmOrange = 0xEA43;
+  const uint16_t ktmDark = 0x18E3;
+
+  tft.fillScreen(ST77XX_WHITE);
+
+  // Stylized KTM mark built from filled polygons so it does not need bitmap storage.
+  fillQuadHalfLogo(88, 16, 304, 16, 300, 46, 78, 46, ktmOrange);
+
+  fillQuadHalfLogo(16, 72, 64, 72, 44, 174, 0, 174, ktmOrange);
+  fillQuadHalfLogo(64, 118, 130, 72, 164, 72, 92, 126, ktmOrange);
+  fillQuadHalfLogo(64, 118, 104, 174, 154, 174, 92, 126, ktmOrange);
+
+  fillQuadHalfLogo(146, 46, 194, 46, 164, 174, 116, 174, ktmOrange);
+
+  fillQuadHalfLogo(178, 72, 224, 72, 202, 174, 154, 174, ktmOrange);
+  fillQuadHalfLogo(208, 122, 262, 72, 306, 72, 234, 174, ktmOrange);
+  fillQuadHalfLogo(272, 72, 318, 72, 298, 174, 252, 174, ktmOrange);
+
+  tft.drawFastHLine(90, 146, 140, ktmOrange);
+  tft.drawFastHLine(102, 152, 116, ktmDark);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ktmDark, ST77XX_WHITE);
+  tft.setCursor(46, 178);
+  tft.print("READY TO");
+
+  tft.setTextColor(ktmOrange, ST77XX_WHITE);
+  tft.setCursor(152, 178);
+  tft.print(">>");
+
+  tft.setTextColor(ktmDark, ST77XX_WHITE);
+  tft.setCursor(190, 178);
+  tft.print("RACE");
+}
+
+void drawHeader()
+{
+  tft.fillRect(0, 0, 320, 22, DASH_DARK_BLUE);
+  tft.drawFastHLine(0, 21, 320, DASH_BLUE);
+
+  tft.setTextSize(2);
+  tft.setTextColor(DASH_ORANGE, DASH_DARK_BLUE);
+  tft.setCursor(6, 4);
+  tft.print("RC");
+  tft.setTextColor(ST77XX_WHITE, DASH_DARK_BLUE);
+  tft.print("390");
+
+  tft.setTextSize(1);
+  tft.setCursor(82, 7);
+  tft.print(" READY TO RACE >>");
+
+  tft.fillCircle(222, 8, 2, ST77XX_WHITE);
+  tft.drawLine(216, 13, 222, 6, ST77XX_WHITE);
+  tft.drawLine(222, 6, 228, 13, ST77XX_WHITE);
+
+  tft.setCursor(240, 7);
+  tft.print(WiFi.softAPIP());
+}
+
+void drawStaticDashboard()
+{
+  tft.fillScreen(ST77XX_BLACK);
+  drawHeader();
+
+  drawPanel(0, 24, 320, 42, DASH_BLUE);
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+  tft.setCursor(8, 32);
+  tft.print("RPM");
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setCursor(10, 50);
+  tft.print("x1000");
+
+  for (int i = 0; i <= 16; i += 2)
+  {
+    int x = 64 + (i * 11);
+    tft.setCursor(x, 30);
+    tft.print(i);
+  }
+
+  drawPanel(0, 68, 70, 88, DASH_BLUE);
+  tft.setTextSize(1);
+  tft.setTextColor(DASH_PURPLE, ST77XX_BLACK);
+  tft.setCursor(22, 74);
+  tft.print("GEAR");
+
+  drawPanel(74, 68, 172, 88, DASH_CYAN);
+  tft.setTextSize(2);
+  tft.setTextColor(DASH_CYAN, ST77XX_BLACK);
+  tft.setCursor(124, 74);
+  tft.print("SPEED");
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setCursor(147, 143);
+  tft.print("km/h");
+
+  drawPanel(250, 68, 70, 88, DASH_BLUE);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+  tft.setCursor(260, 75);
+  tft.print("TOP");
+  tft.setCursor(256, 85);
+  tft.print("SPEED");
+  tft.setCursor(274, 140);
+  tft.print("km/h");
+
+  const int sensorY = 158;
+  const char *labels[] = {"ECT", "IAT", "MAP", "TPS", "FUEL"};
+  const uint16_t colors[] = {DASH_CYAN, DASH_CYAN, DASH_CYAN, ST77XX_GREEN, DASH_ORANGE};
+  for (int i = 0; i < 5; i++)
+  {
+    int x = i * 64;
+    drawPanel(x, sensorY, 62, 48, colors[i]);
+    tft.setTextSize(1);
+    tft.setTextColor(colors[i], ST77XX_BLACK);
+    tft.setCursor(x + 18, sensorY + 5);
+    tft.print(labels[i]);
+  }
+
+  drawPanel(0, 208, 320, 32, DASH_BLUE);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+  tft.setCursor(8, 214);
+  tft.print("CAN");
+  tft.setTextColor(DASH_CYAN, ST77XX_BLACK);
+  tft.setCursor(86, 214);
+  tft.print("OBD");
+  tft.setTextColor(DASH_CYAN, ST77XX_BLACK);
+  tft.setCursor(154, 214);
+  tft.print("TEMP");
+  tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+  tft.setCursor(238, 214);
+  tft.print("VOLT");
+}
+
+void drawRpmBar(int rpmValue, bool valid)
+{
+  tft.fillRect(64, 42, 188, 14, ST77XX_BLACK);
+  tft.fillRect(258, 33, 58, 24, ST77XX_BLACK);
+
+  bool rpmWarning = valid && rpmValue > rpmRedLimit;
+  int lit = valid ? map(constrain(rpmValue, 0, 16000), 0, 16000, 0, 32) : 0;
+  for (int i = 0; i < 32; i++)
+  {
+    int x = 64 + i * 6;
+    uint16_t color = DASH_DIM;
+    if (i < lit)
+    {
+      if (rpmWarning)
+        color = ST77XX_RED;
+      else if (i < 16)
+        color = ST77XX_GREEN;
+      else if (i < 23)
+        color = ST77XX_YELLOW;
+      else if (i < 27)
+        color = DASH_ORANGE;
+      else
+        color = ST77XX_RED;
+    }
+    tft.fillRect(x, 42, 4, 14, color);
+  }
+
+  char buf[12];
+  if (valid)
+    snprintf(buf, sizeof(buf), "%d", rpmValue);
+  else
+    strcpy(buf, "---");
+  printCentered(258, 32, 58, 26, buf, valid ? (rpmWarning ? ST77XX_RED : ST77XX_GREEN) : DASH_DIM, 2);
+}
+
+void drawGearValue(int gearValue, bool valid)
+{
+  tft.fillRect(8, 90, 54, 58, ST77XX_BLACK);
+  char buf[4];
+  if (!valid)
+    strcpy(buf, "-");
+  else if (gearValue == 0)
+    strcpy(buf, "N");
+  else
+    snprintf(buf, sizeof(buf), "%d", gearValue);
+  printCentered(8, 88, 54, 50, buf, valid ? DASH_PURPLE : DASH_DIM, 5);
+
+  tft.setTextSize(1);
+  for (int i = 0; i < 7; i++)
+  {
+    int x = 8 + i * 8;
+    bool active = valid && ((i == 0 && gearValue == 0) || gearValue == i);
+    tft.setTextColor(active ? ST77XX_GREEN : DASH_DIM, ST77XX_BLACK);
+    tft.setCursor(x, 140);
+    if (i == 0)
+      tft.print("N");
+    else
+      tft.print(i);
+  }
+}
+
+void drawSpeedValue(int spdValue, bool valid)
+{
+  tft.fillRect(84, 92, 152, 48, ST77XX_BLACK);
+  char buf[8];
+  if (valid)
+    snprintf(buf, sizeof(buf), "%d", spdValue);
+  else
+    strcpy(buf, "---");
+  printCentered(84, 88, 152, 56, buf, valid ? ST77XX_WHITE : DASH_DIM, 6);
+}
+
+void drawFullScreenSpeed(int spdValue, bool valid)
+{
+  const uint16_t darkRed = 0x4000;
+  const uint16_t deepRed = 0x7800;
+  const uint16_t panelDark = 0x1082;
+  const uint16_t warnColor = ST77XX_RED;
+
+  tft.fillScreen(ST77XX_BLACK);
+  tft.fillRect(0, 0, 320, 34, darkRed);
+  tft.drawFastHLine(0, 34, 320, warnColor);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_WHITE, darkRed);
+  tft.setCursor(12, 9);
+  tft.print("SPEED LIMIT");
+
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_YELLOW, darkRed);
+  tft.setCursor(224, 7);
+  tft.print("OVER");
+  tft.setCursor(224, 19);
+  tft.print("WARNING");
+
+  for (int i = 0; i < 3; i++)
+  {
+    int x = 284 + i * 10;
+    tft.fillTriangle(x, 8, x, 26, x + 8, 17, ST77XX_YELLOW);
+  }
+
+  drawPanel(8, 42, 304, 122, warnColor);
+
+  char buf[8];
+  if (valid)
+    snprintf(buf, sizeof(buf), "%d", spdValue);
+  else
+    strcpy(buf, "---");
+  printCentered(8, 48, 304, 82, buf, ST77XX_WHITE, 10);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_RED, ST77XX_BLACK);
+  tft.setCursor(132, 134);
+  tft.print("km/h");
+
+  int gaugeMax = max(speedFullscreenLimit + 40, 140);
+  int gaugeFill = valid ? map(constrain(spdValue, 0, gaugeMax), 0, gaugeMax, 0, 284) : 0;
+  int limitX = map(constrain(speedFullscreenLimit, 0, gaugeMax), 0, gaugeMax, 18, 302);
+
+  tft.fillRoundRect(18, 174, 284, 18, 4, panelDark);
+  tft.fillRoundRect(18, 174, gaugeFill, 18, 4, deepRed);
+  tft.drawRoundRect(18, 174, 284, 18, 4, DASH_DIM);
+  tft.drawFastVLine(limitX, 169, 28, ST77XX_YELLOW);
+  tft.fillTriangle(limitX - 4, 168, limitX + 4, 168, limitX, 174, ST77XX_YELLOW);
+
+  tft.setTextSize(1);
+  tft.setTextColor(DASH_DIM, ST77XX_BLACK);
+  tft.setCursor(18, 198);
+  tft.print("0");
+  tft.setCursor(278, 198);
+  tft.print(gaugeMax);
+  tft.setTextColor(ST77XX_YELLOW, ST77XX_BLACK);
+  tft.setCursor(limitX > 250 ? 232 : limitX + 6, 198);
+  tft.print("LIMIT");
+
+  tft.fillRoundRect(8, 212, 96, 24, 4, panelDark);
+  tft.fillRoundRect(112, 212, 96, 24, 4, panelDark);
+  tft.fillRoundRect(216, 212, 96, 24, 4, panelDark);
+
+  tft.setTextSize(1);
+  tft.setTextColor(DASH_DIM, panelDark);
+  tft.setCursor(16, 216);
+  tft.print("LIMIT");
+  tft.setCursor(120, 216);
+  tft.print("TOP");
+  tft.setCursor(224, 216);
+  tft.print("RPM");
+
+  tft.setTextColor(ST77XX_WHITE, panelDark);
+  tft.setCursor(60, 216);
+  tft.print(speedFullscreenLimit);
+  tft.setCursor(156, 216);
+  tft.print(topSpeedKmh);
+  tft.setCursor(258, 216);
+  tft.print(gotRPM ? String((int)rpm) : "---");
+}
+
+void drawTopSpeedValue(int topValue)
+{
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d", topValue);
+  tft.fillRect(256, 100, 58, 36, ST77XX_BLACK);
+  printCentered(256, 96, 58, 42, buf, ST77XX_YELLOW, 3);
+}
+
+void drawSensorValue(int idx, const char *value, const char *unit, uint16_t color, int fill)
+{
+  int x = idx * 64;
+  tft.fillRect(x + 4, 174, 54, 20, ST77XX_BLACK);
+  uint8_t valueSize = strlen(value) >= 5 ? 1 : 2;
+  printCentered(x + 4, 171, 54, 24, value, ST77XX_WHITE, valueSize);
+
+  tft.fillRect(x + 6, 196, 50, 6, ST77XX_BLACK);
+  tft.drawFastHLine(x + 8, 199, 46, DASH_DIM);
+  int bar = constrain(fill, 0, 46);
+  tft.fillRect(x + 8, 197, bar, 4, color);
+
+  tft.setTextSize(1);
+  tft.setTextColor(DASH_DIM, ST77XX_BLACK);
+  tft.setCursor(x + 42, 190);
+  tft.print(unit);
+}
+
+void drawStatusBar(bool canAlive)
+{
+  tft.fillRect(8, 225, 304, 10, ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(canAlive ? ST77XX_GREEN : ST77XX_RED, ST77XX_BLACK);
+  tft.setCursor(8, 225);
+  tft.print(canAlive ? "OK" : "TIMEOUT");
+
+  tft.setTextColor(DASH_CYAN, ST77XX_BLACK);
+  tft.setCursor(86, 225);
+  tft.print(canAlive ? "OK" : "---");
+
+  tft.setTextColor(ST77XX_GREEN, ST77XX_BLACK);
+  tft.setCursor(154, 225);
+  tft.print(coolantC > 100 ? "HOT" : "NORMAL");
+
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setCursor(238, 225);
+  tft.print("--.- V");
+}
+
+const char *gearTextC()
+{
+  static char buf[4];
+  if (!gotGear)
+    return "---";
+  if (gear == 0)
+    return "N";
+  snprintf(buf, sizeof(buf), "%d", gear);
+  return buf;
+}
+
+void initTFT()
+{
+  deselectAllSPI();
+
+  tft.init(240, 320);
+  tft.setRotation(1);
+  tft.invertDisplay(false);
+  tft.setTextWrap(false);
+
+  drawKtmSplash();
+  delay(1800);
+  drawStaticDashboard();
+  invalidateUiCache();
+}
+
+void updateScreenOptimized(bool force = false)
+{
+  unsigned long now = millis();
+  if (!force && (now - lastScreen < SCREEN_INTERVAL_MS))
+    return;
+  lastScreen = now;
+
+  bool canAlive = (now - lastDataMs) < 2000;
+
+  int rpm_i = gotRPM ? (int)rpm : INVALID_VAL;
+  int spd_i = gotSPD ? speedKmh : INVALID_VAL;
+  int topspd_i = topSpeedKmh;
+  int ect_i = gotECT ? coolantC : INVALID_VAL;
+  int iat_i = gotIAT ? iatC : INVALID_VAL;
+  int map_i = gotMAP ? mapKpa : INVALID_VAL;
+  int gear_i = gotGear ? gear : INVALID_VAL;
+  int tps10_i = gotTPS ? (int)(tpsPercent * 10.0f + 0.5f) : INVALID_VAL;
+  int fuel10_i = gotFuel ? (int)(fuelPercent * 10.0f + 0.5f) : INVALID_VAL;
+  int can_i = canAlive ? 1 : 0;
+
+  char buf[20];
+
+  deselectAllSPI();
+
+  bool speedFullscreen = gotSPD && speedKmh > speedFullscreenLimit;
+  if (speedFullscreen)
+  {
+    if (!speedFullscreenActive || needsRedraw(uiCache.spd, spd_i, SPD_REDRAW_DELTA, force))
+    {
+      drawFullScreenSpeed(spd_i, gotSPD);
+      uiCache.spd = spd_i;
+    }
+    speedFullscreenActive = true;
+    return;
+  }
+
+  if (speedFullscreenActive)
+  {
+    speedFullscreenActive = false;
+    drawStaticDashboard();
+    invalidateUiCache();
+    force = true;
+  }
+
+  if (needsRedraw(uiCache.rpm, rpm_i, RPM_REDRAW_DELTA, force))
+  {
+    drawRpmBar(rpm_i, gotRPM);
+    uiCache.rpm = rpm_i;
+  }
+
+  if (needsRedraw(uiCache.spd, spd_i, SPD_REDRAW_DELTA, force))
+  {
+    drawSpeedValue(spd_i, gotSPD);
+    uiCache.spd = spd_i;
+  }
+
+  if (force || uiCache.gear != gear_i)
+  {
+    drawGearValue(gear, gotGear);
+    uiCache.gear = gear_i;
+  }
+
+  if (needsRedraw(uiCache.ect, ect_i, TEMP_REDRAW_DELTA, force))
+  {
+    if (gotECT)
+      snprintf(buf, sizeof(buf), "%d", ect_i);
+    else
+      strcpy(buf, "---");
+    drawSensorValue(0, buf, "C", DASH_CYAN, gotECT ? map(constrain(ect_i, 40, 120), 40, 120, 0, 46) : 0);
+    uiCache.ect = ect_i;
+  }
+
+  if (needsRedraw(uiCache.iat, iat_i, TEMP_REDRAW_DELTA, force))
+  {
+    if (gotIAT)
+      snprintf(buf, sizeof(buf), "%d", iat_i);
+    else
+      strcpy(buf, "---");
+    drawSensorValue(1, buf, "C", DASH_CYAN, gotIAT ? map(constrain(iat_i, 0, 80), 0, 80, 0, 46) : 0);
+    uiCache.iat = iat_i;
+  }
+
+  if (needsRedraw(uiCache.map, map_i, MAP_REDRAW_DELTA, force))
+  {
+    if (gotMAP)
+      snprintf(buf, sizeof(buf), "%d", map_i);
+    else
+      strcpy(buf, "---");
+    drawSensorValue(2, buf, "kPa", DASH_CYAN, gotMAP ? map(constrain(map_i, 0, 120), 0, 120, 0, 46) : 0);
+    uiCache.map = map_i;
+  }
+
+  if (needsRedraw(uiCache.tps10, tps10_i, TPS_REDRAW_DELTA10, force))
+  {
+    if (gotTPS)
+      snprintf(buf, sizeof(buf), "%d.%d", tps10_i / 10, abs(tps10_i % 10));
+    else
+      strcpy(buf, "---");
+    drawSensorValue(3, buf, "%", ST77XX_GREEN, gotTPS ? map(constrain(tps10_i, 0, 1000), 0, 1000, 0, 46) : 0);
+    uiCache.tps10 = tps10_i;
+  }
+
+  if (needsRedraw(uiCache.fuel10, fuel10_i, FUEL_REDRAW_DELTA10, force))
+  {
+    if (gotFuel)
+      snprintf(buf, sizeof(buf), "%d.%d", fuel10_i / 10, abs(fuel10_i % 10));
+    else
+      strcpy(buf, "---");
+    drawSensorValue(4, buf, "%", DASH_ORANGE, gotFuel ? map(constrain(fuel10_i, 0, 1000), 0, 1000, 0, 46) : 0);
+    uiCache.fuel10 = fuel10_i;
+  }
+  if (needsRedraw(uiCache.topspd, topspd_i, SPD_REDRAW_DELTA, force))
+  {
+    drawTopSpeedValue(topspd_i);
+    uiCache.topspd = topspd_i;
+  }
+  if (force || uiCache.canAlive != can_i)
+  {
+    drawStatusBar(canAlive);
+    uiCache.canAlive = can_i;
+  }
+}
+// =========================
+// CAN / OBD
+// =========================
+void sendOBDRequest(uint8_t pid)
+{
+  txFrame.can_id = 0x7DF;
+  txFrame.can_dlc = 8;
+  txFrame.data[0] = 0x02;
+  txFrame.data[1] = 0x01;
+  txFrame.data[2] = pid;
+  txFrame.data[3] = 0x00;
+  txFrame.data[4] = 0x00;
+  txFrame.data[5] = 0x00;
+  txFrame.data[6] = 0x00;
+  txFrame.data[7] = 0x00;
+  mcp2515.sendMessage(&txFrame);
+}
+
+void requestScheduler()
+{
+  unsigned long now = millis();
+
+  if (now - lastReqAny < MIN_OBD_REQ_GAP_MS)
+    return;
+
+  if (now - lastReqRPM >= RPM_REQ_MS)
+  {
+    deselectAllSPI();
+    sendOBDRequest(PID_RPM);
+    lastReqRPM = now;
+    lastReqAny = now;
+    return;
+  }
+
+  if (now - lastReqSPD >= SPD_REQ_MS)
+  {
+    deselectAllSPI();
+    sendOBDRequest(PID_SPD);
+    lastReqSPD = now;
+    lastReqAny = now;
+    return;
+  }
+
+  if (now - lastReqTPS >= TPS_REQ_MS)
+  {
+    deselectAllSPI();
+    sendOBDRequest(PID_TPS);
+    lastReqTPS = now;
+    lastReqAny = now;
+    return;
+  }
+
+  if (now - lastReqSlow >= SLOW_REQ_MS)
+  {
+    deselectAllSPI();
+    if (slowIdx == 0)
+      sendOBDRequest(PID_ECT);
+    else if (slowIdx == 1)
+      sendOBDRequest(PID_IAT);
+    else
+      sendOBDRequest(PID_MAP);
+
+    slowIdx++;
+    if (slowIdx >= 3)
+      slowIdx = 0;
+    lastReqSlow = now;
+    lastReqAny = now;
+    return;
+  }
+
+  if (now - lastReqFuel >= FUEL_REQ_MS)
+  {
+    deselectAllSPI();
+    sendOBDRequest(PID_FUEL);
+    lastReqFuel = now;
+    lastReqAny = now;
+    return;
+  }
+}
+
+void decodeOBD(const can_frame &f)
+{
+  if (f.can_id < 0x7E8 || f.can_id > 0x7EF)
+    return;
+  if (f.can_dlc < 4)
+    return;
+  if (f.data[1] != 0x41)
+    return;
+
+  uint8_t pid = f.data[2];
+  lastDataMs = millis();
+
+  switch (pid)
+  {
+  case PID_RPM:
+    if (f.can_dlc >= 5)
+    {
+      int A = f.data[3];
+      int B = f.data[4];
+      rpm = ((A * 256.0f) + B) / 4.0f;
+      gotRPM = true;
+    }
+    break;
+
+  case PID_SPD:
+    speedKmh = f.data[3];
+    if (speedKmh > topSpeedKmh)
+      topSpeedKmh = speedKmh;
+    gotSPD = true;
+    break;
+
+  case PID_ECT:
+    coolantC = (int)f.data[3] - 40;
+    gotECT = true;
+    break;
+
+  case PID_IAT:
+    iatC = (int)f.data[3] - 40;
+    gotIAT = true;
+    break;
+
+  case PID_MAP:
+    mapKpa = f.data[3];
+    gotMAP = true;
+    break;
+
+  case PID_TPS:
+  {
+    tpsRawPercent = f.data[3] * 100.0f / 255.0f;
+
+    tpsPercent =
+        (tpsRawPercent - tpsCalMin) *
+        100.0f /
+        (tpsCalMax - tpsCalMin);
+
+    if (tpsPercent < 0)
+      tpsPercent = 0;
+    if (tpsPercent > 100)
+      tpsPercent = 100;
+
+    gotTPS = true;
+  }
+  break;
+
+  case PID_FUEL:
+    fuelPercent = f.data[3] * 100.0f / 255.0f;
+    gotFuel = true;
+    break;
+  }
+}
+
+void decodeCustomFrames(const can_frame &f)
+{
+  if (f.can_id != 0x540 || f.can_dlc < 8)
+    return;
+
+  if (f.data[0] == 0x02 && f.data[6] == 0x01)
+  {
+    uint8_t v = f.data[3];
+
+    if (v >= 1 && v <= 6)
+    {
+      gear = v;
+      gotGear = true;
+      neutralCandidateMs = 0;
+      lastGearMs = millis();
+      return;
+    }
+
+    if (v == 0 && speedKmh == 0)
+    {
+      if (neutralCandidateMs == 0)
+      {
+        neutralCandidateMs = millis();
+      }
+      else if (millis() - neutralCandidateMs >= NEUTRAL_DEBOUNCE_MS)
+      {
+        gear = 0;
+        gotGear = true;
+        lastGearMs = millis();
+      }
+      return;
+    }
+  }
+
+  if ((f.data[0] == 0x04 || f.data[0] == 0x06) && speedKmh == 0)
+  {
+    if (neutralCandidateMs == 0)
+      neutralCandidateMs = millis();
+    return;
+  }
+
+  neutralCandidateMs = 0;
+}
+
+// =========================
+// Web handlers
+// =========================
+void loadConfig()
+{
+  prefs.begin("rc390", false);
+  rpmRedLimit = prefs.getInt("rpmLimit", DEFAULT_RPM_RED_LIMIT);
+  speedFullscreenLimit = prefs.getInt("spdLimit", DEFAULT_SPEED_FULLSCREEN_LIMIT);
+  tpsCalMin = prefs.getFloat("tpsMin", DEFAULT_TPS_MIN);
+  tpsCalMax = prefs.getFloat("tpsMax", DEFAULT_TPS_MAX);
+  rpmRedLimit = constrain(rpmRedLimit, 1000, 16000);
+  speedFullscreenLimit = constrain(speedFullscreenLimit, 1, 300);
+  normalizeTpsCalibration();
+}
+
+String configJson(bool tpsCalOk = true)
+{
+  String json = "{";
+  json += "\"rpmLimit\":" + String(rpmRedLimit) + ",";
+  json += "\"speedLimit\":" + String(speedFullscreenLimit) + ",";
+  json += "\"tpsMin\":" + String(tpsCalMin, 1) + ",";
+  json += "\"tpsMax\":" + String(tpsCalMax, 1) + ",";
+  json += "\"tpsCalOk\":" + String(tpsCalOk ? "true" : "false");
+  json += "}";
+  return json;
+}
+
+void handleRoot()
+{
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleApiConfig()
+{
+  bool tpsCalOk = true;
+
+  if (server.method() == HTTP_POST)
+  {
+    if (server.hasArg("rpmLimit"))
+      rpmRedLimit = constrain(server.arg("rpmLimit").toInt(), 1000, 16000);
+    if (server.hasArg("speedLimit"))
+      speedFullscreenLimit = constrain(server.arg("speedLimit").toInt(), 1, 300);
+    if (server.hasArg("tpsMin"))
+      tpsCalMin = server.arg("tpsMin").toFloat();
+    if (server.hasArg("tpsMax"))
+      tpsCalMax = server.arg("tpsMax").toFloat();
+    if (server.hasArg("tpsCalibrate"))
+    {
+      if (gotTPS)
+      {
+        String point = server.arg("tpsCalibrate");
+        if (point == "min")
+          tpsCalMin = tpsRawPercent;
+        else if (point == "max")
+          tpsCalMax = tpsRawPercent;
+      }
+      else
+      {
+        tpsCalOk = false;
+      }
+    }
+
+    normalizeTpsCalibration();
+
+    prefs.putInt("rpmLimit", rpmRedLimit);
+    prefs.putInt("spdLimit", speedFullscreenLimit);
+    prefs.putFloat("tpsMin", tpsCalMin);
+    prefs.putFloat("tpsMax", tpsCalMax);
+    invalidateUiCache();
+  }
+
+  server.send(200, "application/json", configJson(tpsCalOk));
+}
+
+void handleApiData()
+{
+  bool canAlive = (millis() - lastDataMs) < 2000;
+
+  String json = "{";
+  json += "\"rpm\":" + String((int)rpm) + ",";
+  json += "\"speed\":" + String(speedKmh) + ",";
+  json += "\"coolant\":" + String(coolantC) + ",";
+  json += "\"iat\":" + String(iatC) + ",";
+  json += "\"map\":" + String(mapKpa) + ",";
+  json += "\"tpsRaw\":" + String(tpsRawPercent, 1) + ",";
+  json += "\"tps\":" + String(tpsPercent, 1) + ",";
+  json += "\"fuel\":" + String(fuelPercent, 1) + ",";
+  json += "\"gear\":" + String(gear) + ",";
+  json += "\"gotRPM\":" + String(gotRPM ? "true" : "false") + ",";
+  json += "\"gotSPD\":" + String(gotSPD ? "true" : "false") + ",";
+  json += "\"gotECT\":" + String(gotECT ? "true" : "false") + ",";
+  json += "\"gotIAT\":" + String(gotIAT ? "true" : "false") + ",";
+  json += "\"gotMAP\":" + String(gotMAP ? "true" : "false") + ",";
+  json += "\"gotTPS\":" + String(gotTPS ? "true" : "false") + ",";
+  json += "\"gotFuel\":" + String(gotFuel ? "true" : "false") + ",";
+  json += "\"gotGear\":" + String(gotGear ? "true" : "false") + ",";
+  json += "\"canAlive\":" + String(canAlive ? "true" : "false") + ",";
+  json += "\"rpmLimit\":" + String(rpmRedLimit) + ",";
+  json += "\"speedLimit\":" + String(speedFullscreenLimit) + ",";
+  json += "\"tpsMin\":" + String(tpsCalMin, 1) + ",";
+  json += "\"tpsMax\":" + String(tpsCalMax, 1) + ",";
+  json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleNotFound()
+{
+  server.send(404, "text/plain", "Not found");
+}
+
+// =========================
+// Setup DEBUG
+// =========================
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  dbg("STEP 1: boot ok");
+
+  pinMode(CAN_CS, OUTPUT);
+  pinMode(TFT_CS, OUTPUT);
+  pinMode(TOUCH_CS, OUTPUT);
+  pinMode(SD_CS, OUTPUT);
+
+  digitalWrite(CAN_CS, HIGH);
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TOUCH_CS, HIGH);
+  digitalWrite(SD_CS, HIGH);
+
+  dbg("STEP 2: pin ok");
+
+  loadConfig();
+  dbg("STEP 2B: config ok");
+
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
+  dbg("STEP 3: SPI ok");
+
+  dbg("STEP 4: before TFT");
+  initTFT();
+  dbg("STEP 5: after TFT");
+
+  updateScreenOptimized(true);
+  dbg("STEP 6: screen drawn");
+
+  dbg("STEP 7: before MCP reset");
+  deselectAllSPI();
+  mcp2515.reset();
+  dbg("STEP 8: after MCP reset");
+
+  mcp2515.setBitrate(CAN_SPEED, MCP_CLOCK);
+  dbg("STEP 9: bitrate ok");
+
+  mcp2515.setNormalMode();
+  dbg("STEP 10: normal mode ok");
+
+  WiFi.mode(WIFI_AP);
+  IPAddress local_ip(192, 168, 1, 82);
+  IPAddress gateway(192, 168, 1, 82);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_ip, gateway, subnet);
+  dbg("STEP 11: wifi config ok");
+
+  bool apOk;
+  if (strlen(AP_PASS) >= 8)
+    apOk = WiFi.softAP(AP_SSID, AP_PASS);
+  else
+    apOk = WiFi.softAP(AP_SSID);
+
+  if (apOk)
+    dbg("STEP 12: hotspot started");
+  else
+    dbg("STEP 12: hotspot failed");
+
+  drawHeader();
+
+  server.on("/", handleRoot);
+  server.on("/api/data", handleApiData);
+  server.on("/api/config", handleApiConfig);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  dbg("STEP 13: web ok");
+  dbg("SETUP DONE");
+}
+
+// =========================
+// Loop
+// =========================
+void loop()
+{
+  server.handleClient();
+
+  deselectAllSPI();
+  while (mcp2515.readMessage(&rxFrame) == MCP2515::ERROR_OK)
+  {
+    decodeOBD(rxFrame);
+    decodeCustomFrames(rxFrame);
+  }
+
+  requestScheduler();
+
+  if (gotGear && (millis() - lastGearMs > GEAR_HOLD_MS))
+  {
+    // giu gia tri cu
+  }
+
+  updateScreenOptimized();
+
+  if (millis() - lastPrint >= 1000)
+  {
+    Serial.print("RPM=");
+    Serial.print(gotRPM ? String((int)rpm) : "---");
+    Serial.print(" | SPD=");
+    Serial.print(gotSPD ? String(speedKmh) : "---");
+    Serial.print(" | ECT=");
+    Serial.print(gotECT ? String(coolantC) : "---");
+    Serial.print(" | IAT=");
+    Serial.print(gotIAT ? String(iatC) : "---");
+    Serial.print(" | MAP=");
+    Serial.print(gotMAP ? String(mapKpa) : "---");
+    Serial.print(" | TPS=");
+    Serial.print(gotTPS ? String(tpsPercent, 1) : "---");
+    Serial.print(" | FUEL=");
+    Serial.print(gotFuel ? String(fuelPercent, 1) : "---");
+    Serial.print(" | GEAR=");
+    Serial.println(gearTextC());
+
+    lastPrint = millis();
+  }
+}
